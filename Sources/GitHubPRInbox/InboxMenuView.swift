@@ -62,6 +62,8 @@ struct InboxMenuView: View {
     private static let maxVisibleRowLimit = 30
     fileprivate static let rowHeight: CGFloat = 28
     private static let menuWidth: CGFloat = 580
+    fileprivate static let workflowRepoColumnWidth: CGFloat = 180
+    fileprivate static let workflowBranchColumnWidth: CGFloat = 132
 
     @ObservedObject var model: InboxViewModel
     @ObservedObject var settings: AppSettings
@@ -87,7 +89,9 @@ struct InboxMenuView: View {
             }
         }
         .padding(12)
-        .frame(width: Self.menuWidth)
+        .frame(width: Self.menuWidth, alignment: .topLeading)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .fixedSize(horizontal: false, vertical: true)
         .background(
             KeyboardEventBridge(
                 onLeftArrow: selectPreviousSection,
@@ -632,14 +636,17 @@ private struct WorkflowFailureRow: View {
                 .font(.caption.weight(.medium))
                 .lineLimit(1)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .layoutPriority(1)
 
-            RepoPill(text: item.repositoryName)
+            RepoPill(text: item.repositoryName, width: InboxMenuView.workflowRepoColumnWidth)
 
             if let branchName = item.branchName, !branchName.isEmpty {
                 Text(branchName)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(width: InboxMenuView.workflowBranchColumnWidth, alignment: .leading)
             }
 
             if isNew {
@@ -667,6 +674,7 @@ private struct WorkflowFailureRow: View {
 
 private struct RepoPill: View {
     let text: String
+    var width: CGFloat?
 
     var body: some View {
         Text(text)
@@ -674,6 +682,7 @@ private struct RepoPill: View {
             .foregroundStyle(.secondary)
             .lineLimit(1)
             .truncationMode(.middle)
+            .frame(width: width, alignment: .leading)
             .padding(.horizontal, 6)
             .padding(.vertical, 3)
             .background(.quaternary.opacity(0.8))
