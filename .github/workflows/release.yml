@@ -143,6 +143,12 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             build
 
+      - name: Ad hoc sign app bundle
+        run: |
+          APP_PATH="build/DerivedData/Build/Products/Release/GitHubPRInbox.app"
+          codesign --force --deep --sign - "$APP_PATH"
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+
       - name: Package app
         run: |
           APP_PATH="build/DerivedData/Build/Products/Release/GitHubPRInbox.app"
@@ -185,6 +191,12 @@ jobs:
             -derivedDataPath build/DerivedData \
             CODE_SIGNING_ALLOWED=NO \
             build
+
+      - name: Ad hoc sign app bundle
+        run: |
+          APP_PATH="build/DerivedData/Build/Products/Release/GitHubPRInbox.app"
+          codesign --force --deep --sign - "$APP_PATH"
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
 
       - name: Package app
         run: |
