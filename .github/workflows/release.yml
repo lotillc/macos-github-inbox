@@ -4,9 +4,116 @@ on:
   push:
     tags:
       - "v*"
+  pull_request_target:
+    types:
+      - closed
 
 jobs:
+  tag-release:
+    if: github.event_name == 'pull_request_target' && github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Determine next version
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          python <<'PY'
+          import os
+          import re
+          import subprocess
+
+          title = os.environ.get("PR_TITLE", "")
+          body = os.environ.get("PR_BODY", "")
+          labels = {
+              label.strip().lower()
+              for label in os.environ.get("PR_LABELS", "").split(",")
+              if label.strip()
+          }
+
+          def latest_tag():
+              result = subprocess.run(
+                  ["git", "tag", "--list", "v*", "--sort=-version:refname"],
+                  capture_output=True,
+                  check=True,
+                  text=True,
+              )
+              tags = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+              return tags[0] if tags else "v0.0.0"
+
+          def parse(tag: str) -> tuple[int, int, int]:
+              match = re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)", tag)
+              if not match:
+                  raise SystemExit(f"Unsupported tag format: {tag}")
+              return tuple(int(part) for part in match.groups())
+
+          level = "patch"
+          combined_text = f"{title}\n{body}".lower()
+
+          if {
+              "semver:major",
+              "release:major",
+              "major",
+          } & labels or "breaking change" in combined_text or re.search(r"^[^:\n]+!\s*:", title.lower()):
+              level = "major"
+          elif {
+              "semver:minor",
+              "release:minor",
+              "minor",
+          } & labels or title.lower().startswith("feat:"):
+              level = "minor"
+          elif {
+              "semver:patch",
+              "release:patch",
+              "patch",
+          } & labels or title.lower().startswith(("fix:", "chore:", "docs:", "refactor:", "perf:", "test:")):
+              level = "patch"
+
+          major, minor, patch = parse(latest_tag())
+          if level == "major":
+              major += 1
+              minor = 0
+              patch = 0
+          elif level == "minor":
+              minor += 1
+              patch = 0
+          else:
+              patch += 1
+
+          next_tag = f"v{major}.{minor}.{patch}"
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
+              env_file.write(f"RELEASE_TAG={next_tag}\n")
+              env_file.write(f"RELEASE_BUMP={level}\n")
+          print(f"Selected {next_tag} ({level})")
+          PY
+
+      - name: Create release tag
+        env:
+          RELEASE_TAG: ${{ env.RELEASE_TAG }}
+          MERGE_COMMIT_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        run: |
+          if git rev-parse "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Tag $RELEASE_TAG already exists"
+            exit 0
+          fi
+
+          git tag "$RELEASE_TAG" "$MERGE_COMMIT_SHA"
+          git push origin "$RELEASE_TAG"
+
   release:
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: macos-latest
     permissions:
       contents: write

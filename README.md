@@ -56,7 +56,7 @@ Unsigned builds may require extra Gatekeeper steps. Signed and notarized release
 
 This repo supports two release modes:
 
-1. Open source source-code releases and unsigned binary zips via GitHub Releases
+1. Automatic semver tagging on merge to `main`, followed by unsigned binary zips via GitHub Releases
 2. Signed and notarized release builds using a Developer ID-enabled Apple account
 
 ## Signing and Notarization
@@ -93,11 +93,17 @@ This repo includes:
 - CI validation on pushes and pull requests
 - a tagged release workflow that builds a macOS app zip and publishes it to GitHub Releases
 
-Tag a version like:
+Merging a PR to `main` automatically creates the next semver tag and publishes a release:
+
+- `major` when the PR has a `semver:major`, `release:major`, or `major` label, or the title/body includes `BREAKING CHANGE`
+- `minor` when the PR has a `semver:minor`, `release:minor`, or `minor` label, or the PR title starts with `feat:`
+- `patch` for everything else
+
+You can still create a release tag manually if needed:
 
 ```bash
 git tag v0.1.0
 git push origin v0.1.0
 ```
 
-That will publish an unsigned release artifact. If you want signed/notarized artifacts, add the required Apple credentials and signing steps to the release workflow or run notarization locally before upload.
+That will also publish an unsigned release artifact. If you want signed/notarized artifacts, add the required Apple credentials and signing steps to the release workflow or run notarization locally before upload.
