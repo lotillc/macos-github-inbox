@@ -72,6 +72,7 @@ struct InboxMenuView: View {
     @State private var selectedSection: InboxSection = .reviewRequests
     @State private var visibleRowLimitBySection: [InboxSection: Int] = [:]
     @State private var highlightedRowIDBySection: [InboxSection: String] = [:]
+    @State private var measuredMenuSize: CGSize = .zero
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -90,8 +91,15 @@ struct InboxMenuView: View {
         }
         .padding(12)
         .frame(width: Self.menuWidth, alignment: .topLeading)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .fixedSize(horizontal: false, vertical: true)
+        .background(MenuSizeReader())
+        .onPreferenceChange(MenuSizePreferenceKey.self) { size in
+            let roundedSize = CGSize(width: ceil(size.width), height: ceil(size.height))
+            if measuredMenuSize != roundedSize {
+                measuredMenuSize = roundedSize
+            }
+        }
+        .background(MenuWindowSizeFitter(size: measuredMenuSize))
         .background(
             KeyboardEventBridge(
                 onLeftArrow: selectPreviousSection,
@@ -273,7 +281,7 @@ struct InboxMenuView: View {
 
     @ViewBuilder
     private func listContent(selectableRows: [SelectableRow]) -> some View {
-        LazyVStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 4) {
             ForEach(selectableRows) { row in
                 Button {
                     open(row)
@@ -699,6 +707,87 @@ private struct NewPill: View {
             .padding(.vertical, 2)
             .background(Color.accentColor.opacity(0.12))
             .clipShape(Capsule())
+    }
+}
+
+private struct MenuSizePreferenceKey: PreferenceKey {
+    static let defaultValue: CGSize = .zero
+
+    static func reduce(value: inout CGSize, nextValue: () -> CGSize) {
+        value = nextValue()
+    }
+}
+
+private struct MenuSizeReader: View {
+    var body: some View {
+        GeometryReader { proxy in
+            Color.clear
+                .preference(key: MenuSizePreferenceKey.self, value: proxy.size)
+        }
+    }
+}
+
+private struct MenuWindowSizeFitter: NSViewRepresentable {
+    let size: CGSize
+
+    func makeNSView(context: Context) -> MenuWindowSizeFittingView {
+        let view = MenuWindowSizeFittingView()
+        view.targetSize = size
+        return view
+    }
+
+    func updateNSView(_ nsView: MenuWindowSizeFittingView, context: Context) {
+        nsView.targetSize = size
+    }
+}
+
+private final class MenuWindowSizeFittingView: NSView {
+    var targetSize: CGSize = .zero {
+        didSet {
+            if oldValue != targetSize {
+                scheduleWindowFit()
+            }
+        }
+    }
+
+    private var hasScheduledWindowFit = false
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        scheduleWindowFit()
+    }
+
+    private func scheduleWindowFit() {
+        guard targetSize.width > 0, targetSize.height > 0, !hasScheduledWindowFit else {
+            return
+        }
+
+        hasScheduledWindowFit = true
+        DispatchQueue.main.async { [weak self] in
+            self?.fitWindowToTargetSize()
+        }
+    }
+
+    private func fitWindowToTargetSize() {
+        hasScheduledWindowFit = false
+
+        guard let window,
+              let contentView = window.contentView,
+              targetSize.width > 0,
+              targetSize.height > 0
+        else {
+            return
+        }
+
+        let targetContentSize = NSSize(width: ceil(targetSize.width), height: ceil(targetSize.height))
+        let currentSize = contentView.frame.size
+        guard abs(currentSize.width - targetContentSize.width) > 0.5
+            || abs(currentSize.height - targetContentSize.height) > 0.5
+        else {
+            return
+        }
+
+        window.setContentSize(targetContentSize)
     }
 }
 
