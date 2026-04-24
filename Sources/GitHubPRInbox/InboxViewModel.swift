@@ -20,8 +20,6 @@ final class InboxViewModel: ObservableObject {
 
     private let settings: AppSettings
     private let tokenStore: KeychainTokenStore
-    private let notificationCenter = UNUserNotificationCenter.current()
-
     private var authoredSource: [PullRequestItem] = []
     private var reviewSource: [PullRequestItem] = []
     private var workflowFailureSource: [WorkflowFailureItem] = []
@@ -441,6 +439,7 @@ final class InboxViewModel: ObservableObject {
     }
 
     private func deliverNotification(identifier: String, title: String, body: String) async {
+        let notificationCenter = UNUserNotificationCenter.current()
         let granted = try? await notificationCenter.requestAuthorization(options: [.badge, .sound, .alert])
         guard granted == true else {
             return
