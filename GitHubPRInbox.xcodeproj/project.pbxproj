@@ -324,7 +324,7 @@
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/../Frameworks";
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "com.johnreynolds.github-pr-inbox";
+				PRODUCT_BUNDLE_IDENTIFIER = "com.lotiai.github-pr-inbox";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = macosx;
 				SWIFT_EMIT_LOC_STRINGS = NO;
@@ -348,7 +348,7 @@
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/../Frameworks";
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "com.johnreynolds.github-pr-inbox";
+				PRODUCT_BUNDLE_IDENTIFIER = "com.lotiai.github-pr-inbox";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = macosx;
 				SWIFT_EMIT_LOC_STRINGS = NO;
