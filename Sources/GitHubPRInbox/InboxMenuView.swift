@@ -745,6 +745,19 @@ final class MenuWindowContentFittingView: NSView {
         scheduleWindowFit()
     }
 
+    override func setFrameSize(_ newSize: NSSize) {
+        let oldSize = frame.size
+        super.setFrameSize(newSize)
+
+        guard abs(oldSize.width - newSize.width) > 0.5
+            || abs(oldSize.height - newSize.height) > 0.5
+        else {
+            return
+        }
+
+        scheduleWindowFit()
+    }
+
     private func scheduleWindowFit() {
         guard !hasScheduledWindowFit else {
             return
@@ -760,20 +773,11 @@ final class MenuWindowContentFittingView: NSView {
         hasScheduledWindowFit = false
 
         guard let window,
-              let contentView = window.contentView
+              let targetContentSize = measuredTargetContentSize()
         else {
             return
         }
 
-        contentView.invalidateIntrinsicContentSize()
-        contentView.layoutSubtreeIfNeeded()
-
-        let fittingSize = contentView.fittingSize
-        guard fittingSize.width > 0, fittingSize.height > 0 else {
-            return
-        }
-
-        let targetContentSize = NSSize(width: ceil(fittingSize.width), height: ceil(fittingSize.height))
         let targetFrameSize = window.frameRect(forContentRect: NSRect(origin: .zero, size: targetContentSize)).size
         let currentFrame = window.frame
         guard abs(currentFrame.width - targetFrameSize.width) > 0.5
@@ -792,6 +796,17 @@ final class MenuWindowContentFittingView: NSView {
             height: targetFrameSize.height
         )
         window.setFrame(targetFrame, display: true)
+    }
+
+    private func measuredTargetContentSize() -> NSSize? {
+        layoutSubtreeIfNeeded()
+
+        let measuredSize = bounds.size
+        guard measuredSize.width > 0, measuredSize.height > 0 else {
+            return nil
+        }
+
+        return NSSize(width: ceil(measuredSize.width), height: ceil(measuredSize.height))
     }
 }
 

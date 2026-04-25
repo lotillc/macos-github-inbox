@@ -24,6 +24,25 @@ struct MenuWindowContentFitterTests {
         #expect(expandedHeight > contractedHeight + 300)
         #expect(contractedHeight < 220)
     }
+
+    @Test
+    func ignoresStaleWindowContentFittingSize() async {
+        let contentView = StaleFittingContentView()
+        let fittingView = MenuWindowContentFittingView()
+        fittingView.frame = NSRect(x: 0, y: 0, width: 240, height: 120)
+
+        contentView.addSubview(fittingView)
+
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 240, height: 800), styleMask: [], backing: .buffered, defer: false)
+        window.contentView = contentView
+        window.orderFront(nil)
+        defer { window.close() }
+
+        fittingView.fitKey = "fit"
+        await settleWindowLayout()
+
+        #expect(window.frame.height < 220)
+    }
 }
 
 @MainActor
@@ -50,6 +69,12 @@ private struct MenuFitterFixture: View {
         .frame(width: 240, alignment: .topLeading)
         .fixedSize(horizontal: false, vertical: true)
         .background(MenuWindowContentFitter(fitKey: "\(model.rowCount)"))
+    }
+}
+
+private final class StaleFittingContentView: NSView {
+    override var fittingSize: NSSize {
+        frame.size
     }
 }
 
