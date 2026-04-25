@@ -86,6 +86,12 @@ Build the app:
 xcodebuild -project GitHubPRInbox.xcodeproj -scheme GitHubPRInbox -configuration Debug build
 ```
 
+Build and install a local Release app into `/Applications`:
+
+```bash
+./scripts/install-app.sh
+```
+
 ## GitHub Releases
 
 This repo includes:
