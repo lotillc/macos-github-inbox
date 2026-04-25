@@ -72,7 +72,6 @@ struct InboxMenuView: View {
     @State private var selectedSection: InboxSection = .reviewRequests
     @State private var visibleRowLimitBySection: [InboxSection: Int] = [:]
     @State private var highlightedRowIDBySection: [InboxSection: String] = [:]
-    @State private var measuredMenuSize: CGSize = .zero
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -92,14 +91,7 @@ struct InboxMenuView: View {
         .padding(12)
         .frame(width: Self.menuWidth, alignment: .topLeading)
         .fixedSize(horizontal: false, vertical: true)
-        .background(MenuSizeReader())
-        .onPreferenceChange(MenuSizePreferenceKey.self) { size in
-            let roundedSize = CGSize(width: ceil(size.width), height: ceil(size.height))
-            if measuredMenuSize != roundedSize {
-                measuredMenuSize = roundedSize
-            }
-        }
-        .background(MenuWindowSizeFitter(size: measuredMenuSize))
+        .background(MenuWindowContentFitter(fitKey: menuSizingKey))
         .background(
             KeyboardEventBridge(
                 onLeftArrow: selectPreviousSection,
@@ -375,6 +367,19 @@ struct InboxMenuView: View {
     private var visibleCITaskKey: String {
         let ids = visiblePullRequestsForCurrentSection().map(\.id).joined(separator: ",")
         return "\(selectedSection.rawValue)|\(ids)"
+    }
+
+    private var menuSizingKey: String {
+        let rows = currentSelectableRows().map(\.id).joined(separator: ",")
+        return [
+            selectedSection.rawValue,
+            rows,
+            "\(model.hasConfigurationIssue)",
+            model.statusMessage ?? "",
+            "\(currentVisibleRowLimit())",
+            "\(settings.hasStoredToken)",
+            "\(settings.scopes.count)",
+        ].joined(separator: "|")
     }
 
     private var highlightedRowID: String? {
@@ -710,41 +715,24 @@ private struct NewPill: View {
     }
 }
 
-private struct MenuSizePreferenceKey: PreferenceKey {
-    static let defaultValue: CGSize = .zero
+struct MenuWindowContentFitter: NSViewRepresentable {
+    let fitKey: String
 
-    static func reduce(value: inout CGSize, nextValue: () -> CGSize) {
-        value = nextValue()
-    }
-}
-
-private struct MenuSizeReader: View {
-    var body: some View {
-        GeometryReader { proxy in
-            Color.clear
-                .preference(key: MenuSizePreferenceKey.self, value: proxy.size)
-        }
-    }
-}
-
-private struct MenuWindowSizeFitter: NSViewRepresentable {
-    let size: CGSize
-
-    func makeNSView(context: Context) -> MenuWindowSizeFittingView {
-        let view = MenuWindowSizeFittingView()
-        view.targetSize = size
+    func makeNSView(context: Context) -> MenuWindowContentFittingView {
+        let view = MenuWindowContentFittingView()
+        view.fitKey = fitKey
         return view
     }
 
-    func updateNSView(_ nsView: MenuWindowSizeFittingView, context: Context) {
-        nsView.targetSize = size
+    func updateNSView(_ nsView: MenuWindowContentFittingView, context: Context) {
+        nsView.fitKey = fitKey
     }
 }
 
-private final class MenuWindowSizeFittingView: NSView {
-    var targetSize: CGSize = .zero {
+final class MenuWindowContentFittingView: NSView {
+    var fitKey = "" {
         didSet {
-            if oldValue != targetSize {
+            if oldValue != fitKey {
                 scheduleWindowFit()
             }
         }
@@ -758,7 +746,7 @@ private final class MenuWindowSizeFittingView: NSView {
     }
 
     private func scheduleWindowFit() {
-        guard targetSize.width > 0, targetSize.height > 0, !hasScheduledWindowFit else {
+        guard !hasScheduledWindowFit else {
             return
         }
 
@@ -772,22 +760,38 @@ private final class MenuWindowSizeFittingView: NSView {
         hasScheduledWindowFit = false
 
         guard let window,
-              let contentView = window.contentView,
-              targetSize.width > 0,
-              targetSize.height > 0
+              let contentView = window.contentView
         else {
             return
         }
 
-        let targetContentSize = NSSize(width: ceil(targetSize.width), height: ceil(targetSize.height))
-        let currentSize = contentView.frame.size
-        guard abs(currentSize.width - targetContentSize.width) > 0.5
-            || abs(currentSize.height - targetContentSize.height) > 0.5
+        contentView.invalidateIntrinsicContentSize()
+        contentView.layoutSubtreeIfNeeded()
+
+        let fittingSize = contentView.fittingSize
+        guard fittingSize.width > 0, fittingSize.height > 0 else {
+            return
+        }
+
+        let targetContentSize = NSSize(width: ceil(fittingSize.width), height: ceil(fittingSize.height))
+        let targetFrameSize = window.frameRect(forContentRect: NSRect(origin: .zero, size: targetContentSize)).size
+        let currentFrame = window.frame
+        guard abs(currentFrame.width - targetFrameSize.width) > 0.5
+            || abs(currentFrame.height - targetFrameSize.height) > 0.5
         else {
             return
         }
 
-        window.setContentSize(targetContentSize)
+        window.contentMinSize = NSSize(width: 1, height: 1)
+        window.minSize = NSSize(width: 1, height: 1)
+
+        let targetFrame = NSRect(
+            x: currentFrame.minX,
+            y: currentFrame.maxY - targetFrameSize.height,
+            width: targetFrameSize.width,
+            height: targetFrameSize.height
+        )
+        window.setFrame(targetFrame, display: true)
     }
 }
 

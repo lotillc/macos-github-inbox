@@ -32,8 +32,9 @@ final class InboxViewModel: ObservableObject {
     private var notifiedCIFailureIDs = Set<String>()
     private var activeCIFailureAlertIDs = Set<String>()
     private var hasEstablishedCIFailureBaseline = false
-    private var hasEstablishedReviewBaseline = false
-    private var hasEstablishedAuthoredBaseline = false
+    private var assignedPullRequestNewItemTracker = NewItemTracker()
+    private var authoredPullRequestNewItemTracker = NewItemTracker()
+    private var workflowFailureNewItemTracker = NewItemTracker()
 
     private let authoredQualifier = "is:open is:pr archived:false author:@me"
     private let reviewQualifier = "is:open is:pr archived:false review-requested:@me"
@@ -89,15 +90,10 @@ final class InboxViewModel: ObservableObject {
             ciStatusCache = [:]
             ciStatusesByPullRequestID = [:]
             ciDebugSummariesByPullRequestID = [:]
-            newlyAssignedPullRequestIDs = []
-            newlyAuthoredPullRequestIDs = []
-            newlyWorkflowFailureIDs = []
             activeCIFailureAlertIDs = []
             notifiedCIFailureIDs = []
             hasEstablishedCIFailureBaseline = false
-            hasEstablishedReviewBaseline = false
-            hasEstablishedAuthoredBaseline = false
-            applySnapshot()
+            applySnapshot(newItemTracking: .reset)
             statusMessage = "Add a GitHub PAT in Settings to load pull requests."
             return
         }
@@ -110,15 +106,10 @@ final class InboxViewModel: ObservableObject {
             ciStatusCache = [:]
             ciStatusesByPullRequestID = [:]
             ciDebugSummariesByPullRequestID = [:]
-            newlyAssignedPullRequestIDs = []
-            newlyAuthoredPullRequestIDs = []
-            newlyWorkflowFailureIDs = []
             activeCIFailureAlertIDs = []
             notifiedCIFailureIDs = []
             hasEstablishedCIFailureBaseline = false
-            hasEstablishedReviewBaseline = false
-            hasEstablishedAuthoredBaseline = false
-            applySnapshot()
+            applySnapshot(newItemTracking: .reset)
             statusMessage = "Add at least one org or repo in Settings."
             return
         }
@@ -154,7 +145,7 @@ final class InboxViewModel: ObservableObject {
             authoredSource = []
             reviewSource = []
             workflowFailureSource = []
-            applySnapshot()
+            applySnapshot(newItemTracking: .reset)
             statusMessage = error.localizedDescription
         }
     }
@@ -200,18 +191,13 @@ final class InboxViewModel: ObservableObject {
             ciStatusCache = [:]
             ciStatusesByPullRequestID = [:]
             ciDebugSummariesByPullRequestID = [:]
-            newlyAssignedPullRequestIDs = []
-            newlyAuthoredPullRequestIDs = []
-            newlyWorkflowFailureIDs = []
             notifiedWorkflowFailureIDs = []
             activeWorkflowFailureAlertIDs = []
             hasEstablishedWorkflowFailureBaseline = false
             notifiedCIFailureIDs = []
             activeCIFailureAlertIDs = []
             hasEstablishedCIFailureBaseline = false
-            hasEstablishedReviewBaseline = false
-            hasEstablishedAuthoredBaseline = false
-            applySnapshot()
+            applySnapshot(newItemTracking: .reset)
             statusMessage = "Add a GitHub PAT in Settings to load pull requests."
         } catch {
             tokenStatusMessage = error.localizedDescription
@@ -236,9 +222,10 @@ final class InboxViewModel: ObservableObject {
     }
 
     func acknowledgeSeenChanges() {
-        newlyAssignedPullRequestIDs = []
-        newlyAuthoredPullRequestIDs = []
-        newlyWorkflowFailureIDs = []
+        assignedPullRequestNewItemTracker.clearNewIDs()
+        authoredPullRequestNewItemTracker.clearNewIDs()
+        workflowFailureNewItemTracker.clearNewIDs()
+        syncNewItemIDs()
     }
 
     func refreshCIStatuses(for items: [PullRequestItem]) async {
@@ -297,8 +284,9 @@ final class InboxViewModel: ObservableObject {
 
     private func bindSettings() {
         settings.$sortOption
+            .dropFirst()
             .sink { [weak self] _ in
-                self?.applySnapshot()
+                self?.applySnapshot(newItemTracking: .preserve)
             }
             .store(in: &cancellables)
 
@@ -324,7 +312,17 @@ final class InboxViewModel: ObservableObject {
         }
     }
 
+    private enum NewItemTrackingMode {
+        case detectArrivals
+        case preserve
+        case reset
+    }
+
     private func applySnapshot() {
+        applySnapshot(newItemTracking: .detectArrivals)
+    }
+
+    private func applySnapshot(newItemTracking: NewItemTrackingMode) {
         let previousReviewIDs = Set(reviewRequests.map(\.id))
         let previousAuthoredIDs = Set(authoredPullRequests.map(\.id))
         let previousWorkflowFailureIDs = Set(workflowFailures.map(\.id))
@@ -344,25 +342,39 @@ final class InboxViewModel: ObservableObject {
         let currentAuthoredIDs = Set(snapshot.authoredPullRequests.map(\.id))
         let currentWorkflowIDs = Set(snapshot.workflowFailures.map(\.id))
 
-        if hasEstablishedReviewBaseline {
-            newlyAssignedPullRequestIDs = currentReviewIDs.subtracting(previousReviewIDs)
-        } else {
-            newlyAssignedPullRequestIDs = []
-            hasEstablishedReviewBaseline = true
+        switch newItemTracking {
+        case .detectArrivals:
+            assignedPullRequestNewItemTracker.detectArrivals(
+                currentIDs: currentReviewIDs,
+                previousIDs: previousReviewIDs
+            )
+            authoredPullRequestNewItemTracker.detectArrivals(
+                currentIDs: currentAuthoredIDs,
+                previousIDs: previousAuthoredIDs
+            )
+            workflowFailureNewItemTracker.detectArrivals(
+                currentIDs: currentWorkflowIDs,
+                previousIDs: previousWorkflowFailureIDs
+            )
+            syncNewItemIDs()
+        case .preserve:
+            break
+        case .reset:
+            resetNewItemTrackers()
+            syncNewItemIDs()
         }
+    }
 
-        if hasEstablishedAuthoredBaseline {
-            newlyAuthoredPullRequestIDs = currentAuthoredIDs.subtracting(previousAuthoredIDs)
-        } else {
-            newlyAuthoredPullRequestIDs = []
-            hasEstablishedAuthoredBaseline = true
-        }
+    private func resetNewItemTrackers() {
+        assignedPullRequestNewItemTracker.reset()
+        authoredPullRequestNewItemTracker.reset()
+        workflowFailureNewItemTracker.reset()
+    }
 
-        if hasEstablishedWorkflowFailureBaseline {
-            newlyWorkflowFailureIDs = currentWorkflowIDs.subtracting(previousWorkflowFailureIDs)
-        } else {
-            newlyWorkflowFailureIDs = []
-        }
+    private func syncNewItemIDs() {
+        newlyAssignedPullRequestIDs = assignedPullRequestNewItemTracker.newIDs
+        newlyAuthoredPullRequestIDs = authoredPullRequestNewItemTracker.newIDs
+        newlyWorkflowFailureIDs = workflowFailureNewItemTracker.newIDs
     }
 
     private func makeClient() -> GitHubClient {

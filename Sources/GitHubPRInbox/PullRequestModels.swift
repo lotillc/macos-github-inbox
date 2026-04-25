@@ -139,6 +139,29 @@ struct InboxSnapshot {
     let workflowFailures: [WorkflowFailureItem]
 }
 
+struct NewItemTracker: Equatable {
+    private(set) var hasEstablishedBaseline = false
+    private(set) var newIDs = Set<String>()
+
+    mutating func detectArrivals(currentIDs: Set<String>, previousIDs: Set<String>) {
+        if hasEstablishedBaseline {
+            newIDs = currentIDs.subtracting(previousIDs)
+        } else {
+            newIDs = []
+            hasEstablishedBaseline = true
+        }
+    }
+
+    mutating func clearNewIDs() {
+        newIDs = []
+    }
+
+    mutating func reset() {
+        hasEstablishedBaseline = false
+        newIDs = []
+    }
+}
+
 enum PullRequestStore {
     static func makeSnapshot(
         reviewRequests: [PullRequestItem],
