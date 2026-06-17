@@ -14,7 +14,7 @@ enum GitHubClientError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .missingToken:
-            "Add a GitHub personal access token in Settings."
+            "Sign in with GitHub in Settings."
         case let .configuration(message):
             message
         case let .unauthorized(message):
@@ -212,7 +212,8 @@ actor GitHubClient {
     }
 
     private let session: URLSession
-    private let tokenProvider: @Sendable () throws -> String
+    private let tokenProvider: @Sendable () async throws -> String
+    private let refreshTokenProvider: (@Sendable () async throws -> String)?
     private let decoder: JSONDecoder
 
     private enum PullRequestReviewGateState {
@@ -225,12 +226,37 @@ actor GitHubClient {
         session: URLSession = .shared,
         tokenProvider: @escaping @Sendable () throws -> String
     ) {
+        self.init(
+            session: session,
+            tokenProvider: { try tokenProvider() },
+            refreshTokenProvider: nil
+        )
+    }
+
+    init(
+        session: URLSession = .shared,
+        tokenProvider: @escaping @Sendable () async throws -> String,
+        refreshTokenProvider: (@Sendable () async throws -> String)? = nil
+    ) {
         self.session = session
         self.tokenProvider = tokenProvider
+        self.refreshTokenProvider = refreshTokenProvider
 
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         self.decoder = decoder
+    }
+
+    init(
+        session: URLSession = .shared,
+        authProvider: GitHubAuthProvider,
+        scopes: [RepositoryScope]
+    ) {
+        self.init(
+            session: session,
+            tokenProvider: { try await authProvider.validAccessToken(expectedScopes: scopes) },
+            refreshTokenProvider: { try await authProvider.forceRefresh(expectedScopes: scopes).accessToken }
+        )
     }
 
     func validateToken() async throws -> GitHubUser {
@@ -481,7 +507,7 @@ actor GitHubClient {
     }
 
     private func requestGraphQLData(query: String) async throws -> Data {
-        let token = try tokenProvider()
+        let token = try await tokenProvider()
         guard !token.isEmpty else {
             throw GitHubClientError.missingToken
         }
@@ -495,27 +521,14 @@ actor GitHubClient {
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
 
-        do {
-            let (data, response) = try await session.data(for: request)
-
-            guard let httpResponse = response as? HTTPURLResponse else {
-                throw GitHubClientError.invalidResponse("GitHub returned a non-HTTP GraphQL response.")
-            }
-
-            guard (200...299).contains(httpResponse.statusCode) else {
-                throw mapHTTPError(statusCode: httpResponse.statusCode, bodyData: data)
-            }
-
-            return data
-        } catch let error as GitHubClientError {
-            throw error
-        } catch {
-            throw GitHubClientError.network(error.localizedDescription)
-        }
+        return try await sendAuthenticatedRequest(
+            request,
+            invalidResponseMessage: "GitHub returned a non-HTTP GraphQL response."
+        )
     }
 
     private func requestData(url: URL) async throws -> Data {
-        let token = try tokenProvider()
+        let token = try await tokenProvider()
         guard !token.isEmpty else {
             throw GitHubClientError.missingToken
         }
@@ -525,14 +538,43 @@ actor GitHubClient {
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
 
+        return try await sendAuthenticatedRequest(
+            request,
+            invalidResponseMessage: "GitHub returned a non-HTTP response."
+        )
+    }
+
+    private func sendAuthenticatedRequest(
+        _ request: URLRequest,
+        invalidResponseMessage: String,
+        allowRetry: Bool = true
+    ) async throws -> Data {
         do {
             let (data, response) = try await session.data(for: request)
 
             guard let httpResponse = response as? HTTPURLResponse else {
-                throw GitHubClientError.invalidResponse("GitHub returned a non-HTTP response.")
+                throw GitHubClientError.invalidResponse(invalidResponseMessage)
             }
 
             guard (200...299).contains(httpResponse.statusCode) else {
+                if httpResponse.statusCode == 401,
+                   allowRetry,
+                   let refreshTokenProvider
+                {
+                    let refreshedToken = try await refreshTokenProvider()
+                    guard !refreshedToken.isEmpty else {
+                        throw GitHubClientError.missingToken
+                    }
+
+                    var retriedRequest = request
+                    retriedRequest.setValue("Bearer \(refreshedToken)", forHTTPHeaderField: "Authorization")
+                    return try await sendAuthenticatedRequest(
+                        retriedRequest,
+                        invalidResponseMessage: invalidResponseMessage,
+                        allowRetry: false
+                    )
+                }
+
                 throw mapHTTPError(statusCode: httpResponse.statusCode, bodyData: data)
             }
 
@@ -864,15 +906,15 @@ actor GitHubClient {
 
         switch statusCode {
         case 401:
-            return .unauthorized("Your GitHub token is invalid or revoked.")
+            return .unauthorized("Your GitHub authorization is invalid, expired, or revoked.")
         case 403:
             let normalizedMessage = message.lowercased()
             if normalizedMessage.contains("saml") || normalizedMessage.contains("single sign-on") {
-                return .unauthorized("Your token needs SSO authorization for one or more selected repositories.")
+                return .unauthorized("Your GitHub authorization needs SSO for one or more selected repositories.")
             }
 
             if normalizedMessage.contains("rate limit") {
-                return .unauthorized("GitHub rate limited this token. Wait a bit and refresh again.")
+                return .unauthorized("GitHub rate limited this session. Wait a bit and refresh again.")
             }
 
             return .unauthorized(message.isEmpty ? "GitHub denied access to one or more selected repositories." : message)

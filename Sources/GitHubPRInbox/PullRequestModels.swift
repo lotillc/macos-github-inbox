@@ -107,6 +107,17 @@ enum RepositoryScope: Hashable, Identifiable {
     }
 }
 
+extension RepositoryScope {
+    var ownerName: String {
+        switch self {
+        case let .org(org):
+            return org
+        case let .repo(repo):
+            return repo.split(separator: "/", maxSplits: 1).first.map(String.init) ?? repo
+        }
+    }
+}
+
 struct PullRequestItem: Identifiable, Hashable {
     let id: String
     let repositoryName: String

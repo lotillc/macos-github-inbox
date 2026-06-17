@@ -1,3 +1,4 @@
+import AppKit
 import Combine
 import Foundation
 import UserNotifications
@@ -8,10 +9,11 @@ final class InboxViewModel: ObservableObject {
     @Published private(set) var authoredPullRequests: [PullRequestItem] = []
     @Published private(set) var workflowFailures: [WorkflowFailureItem] = []
     @Published private(set) var currentUser: GitHubUser?
+    @Published private(set) var authState: GitHubAuthenticationState = .signedOut
     @Published private(set) var isLoading = false
     @Published private(set) var lastRefreshAt: Date?
     @Published private(set) var statusMessage: String?
-    @Published private(set) var tokenStatusMessage: String?
+    @Published private(set) var authStatusMessage: String?
     @Published private(set) var ciStatusesByPullRequestID: [String: PullRequestCIStatus] = [:]
     @Published private(set) var ciDebugSummariesByPullRequestID: [String: String] = [:]
     @Published private(set) var newlyAssignedPullRequestIDs = Set<String>()
@@ -19,7 +21,7 @@ final class InboxViewModel: ObservableObject {
     @Published private(set) var newlyWorkflowFailureIDs = Set<String>()
 
     private let settings: AppSettings
-    private let tokenStore: KeychainTokenStore
+    private let authProvider: GitHubAuthProvider
     private var authoredSource: [PullRequestItem] = []
     private var reviewSource: [PullRequestItem] = []
     private var workflowFailureSource: [WorkflowFailureItem] = []
@@ -35,16 +37,17 @@ final class InboxViewModel: ObservableObject {
     private var assignedPullRequestNewItemTracker = NewItemTracker()
     private var authoredPullRequestNewItemTracker = NewItemTracker()
     private var workflowFailureNewItemTracker = NewItemTracker()
+    private var signInTask: Task<Void, Never>?
 
     private let authoredQualifier = "is:open is:pr archived:false author:@me"
     private let reviewQualifier = "is:open is:pr archived:false review-requested:@me"
 
     init(
         settings: AppSettings,
-        tokenStore: KeychainTokenStore = .shared
+        authProvider: GitHubAuthProvider = GitHubAuthProvider()
     ) {
         self.settings = settings
-        self.tokenStore = tokenStore
+        self.authProvider = authProvider
 
         bindSettings()
         configureRefreshTimer(minutes: settings.refreshIntervalMinutes)
@@ -52,6 +55,10 @@ final class InboxViewModel: ObservableObject {
         Task {
             await refresh()
         }
+    }
+
+    deinit {
+        signInTask?.cancel()
     }
 
     var reviewRequestCount: Int {
@@ -79,37 +86,25 @@ final class InboxViewModel: ObservableObject {
     }
 
     var hasConfigurationIssue: Bool {
-        !settings.hasStoredToken || settings.scopes.isEmpty
+        settings.scopes.isEmpty || !authState.isAuthenticated
+    }
+
+    var appInstallURL: URL? {
+        authProvider.configuration.appInstallationURL
     }
 
     func refresh() async {
-        guard settings.hasStoredToken else {
-            authoredSource = []
-            reviewSource = []
-            workflowFailureSource = []
-            ciStatusCache = [:]
-            ciStatusesByPullRequestID = [:]
-            ciDebugSummariesByPullRequestID = [:]
-            activeCIFailureAlertIDs = []
-            notifiedCIFailureIDs = []
-            hasEstablishedCIFailureBaseline = false
-            applySnapshot(newItemTracking: .reset)
-            statusMessage = "Add a GitHub PAT in Settings to load pull requests."
+        await refreshAuthStatus()
+
+        guard authState.isAuthenticated else {
+            clearLoadedData(resetStatus: false)
+            statusMessage = authState.guidanceText
             return
         }
 
         let scopes = settings.scopes
         guard !scopes.isEmpty else {
-            authoredSource = []
-            reviewSource = []
-            workflowFailureSource = []
-            ciStatusCache = [:]
-            ciStatusesByPullRequestID = [:]
-            ciDebugSummariesByPullRequestID = [:]
-            activeCIFailureAlertIDs = []
-            notifiedCIFailureIDs = []
-            hasEstablishedCIFailureBaseline = false
-            applySnapshot(newItemTracking: .reset)
+            clearLoadedData(resetStatus: false)
             statusMessage = "Add at least one org or repo in Settings."
             return
         }
@@ -118,7 +113,7 @@ final class InboxViewModel: ObservableObject {
         defer { isLoading = false }
 
         do {
-            let client = makeClient()
+            let client = makeClient(scopes: scopes)
             let user = try await client.validateToken()
             async let reviewItems = client.fetchOpenPullRequests(filter: reviewQualifier, scopes: scopes)
             async let authoredItems = client.fetchOpenPullRequests(filter: authoredQualifier, scopes: scopes)
@@ -136,76 +131,166 @@ final class InboxViewModel: ObservableObject {
             await updateWorkflowFailureAlerts()
             await refreshCIStatusesForVisibleItems()
 
-            if reviewRequests.isEmpty && authoredPullRequests.isEmpty && self.workflowFailures.isEmpty {
+            if reviewRequests.isEmpty && authoredPullRequests.isEmpty && workflowFailures.isEmpty {
                 statusMessage = "No open PRs matched your current filters."
             } else {
                 statusMessage = nil
             }
         } catch {
-            authoredSource = []
-            reviewSource = []
-            workflowFailureSource = []
-            applySnapshot(newItemTracking: .reset)
+            clearLoadedData(resetStatus: true)
+            mapRefreshError(error)
             statusMessage = error.localizedDescription
         }
     }
 
-    func saveToken(_ token: String) async {
-        let trimmedToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
+    func beginSignIn() async {
+        signInTask?.cancel()
+        authStatusMessage = nil
 
-        if trimmedToken.isEmpty {
-            do {
-                try tokenStore.deleteToken()
-                settings.reloadTokenPresence()
-                tokenStatusMessage = "Removed the stored token."
-                await refresh()
-            } catch {
-                tokenStatusMessage = error.localizedDescription
+        do {
+            let authorization = try await authProvider.startSignIn(expectedScopes: settings.scopes)
+            authState = .authorizing(authorization)
+            copyVerificationCodeToPasteboard(authorization.userCode)
+            NSWorkspace.shared.open(authorization.browserURL)
+            authStatusMessage = "Verification code copied to the clipboard."
+
+            signInTask = Task { [weak self] in
+                await self?.completePendingAuthPoll()
             }
+        } catch {
+            mapAuthError(error)
+        }
+    }
 
+    func cancelSignIn() {
+        signInTask?.cancel()
+        signInTask = nil
+
+        Task {
+            await authProvider.cancelPendingAuthorization()
+            await refreshAuthStatus()
+            authStatusMessage = "Canceled GitHub sign-in."
+        }
+    }
+
+    func completePendingAuthPoll() async {
+        while !Task.isCancelled {
+            do {
+                let result = try await authProvider.pollSignIn(expectedScopes: settings.scopes)
+
+                switch result {
+                case let .pending(authorization):
+                    authState = .authorizing(authorization)
+                    try await Task.sleep(nanoseconds: UInt64(max(authorization.interval, 1) * 1_000_000_000))
+                case let .completed(credential):
+                    signInTask = nil
+                    settings.reloadCredentialPresence()
+                    currentUser = GitHubUser(login: credential.userLogin)
+                    authStatusMessage = "Signed in as @\(credential.userLogin)."
+                    await refreshAuthStatus()
+                    await refresh()
+                    return
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                signInTask = nil
+                mapAuthError(error)
+                return
+            }
+        }
+    }
+
+    func signOut() {
+        signInTask?.cancel()
+        signInTask = nil
+
+        Task {
+            do {
+                try await authProvider.signOut()
+                settings.reloadCredentialPresence()
+                currentUser = nil
+                authState = .signedOut
+                authStatusMessage = "Signed out of GitHub."
+                statusMessage = "Sign in with GitHub in Settings to load pull requests."
+                clearLoadedData(resetStatus: true)
+            } catch {
+                authStatusMessage = error.localizedDescription
+            }
+        }
+    }
+
+    func refreshAuthStatus() async {
+        settings.reloadCredentialPresence()
+
+        if let configurationMessage = authProvider.configuration.missingConfigurationMessage {
+            authState = .missingConfiguration(configurationMessage)
+            currentUser = nil
+            return
+        }
+
+        if let pendingAuthorization = await authProvider.pendingAuthorizationState() {
+            authState = .authorizing(pendingAuthorization)
             return
         }
 
         do {
-            let validationClient = GitHubClient(tokenProvider: { trimmedToken })
-            let user = try await validationClient.validateToken()
-            try tokenStore.save(token: trimmedToken)
-            settings.reloadTokenPresence()
-            currentUser = user
-            tokenStatusMessage = "Saved token for @\(user.login)."
-            await refresh()
+            guard let credential = try await authProvider.currentCredential() else {
+                authState = .signedOut
+                currentUser = nil
+                return
+            }
+
+            currentUser = GitHubUser(login: credential.userLogin)
+
+            if settings.scopes.isEmpty {
+                authState = .signedIn(
+                    GitHubSessionSummary(
+                        user: GitHubUser(login: credential.userLogin),
+                        tokenExpiresAt: credential.accessTokenExpiresAt,
+                        refreshTokenExpiresAt: credential.refreshTokenExpiresAt,
+                        authorizedOwners: credential.authorizedOwners,
+                        accessibleRepositories: credential.accessibleRepositories
+                    )
+                )
+                return
+            }
+
+            let summary = try await authProvider.validateOrgAccess(expectedScopes: settings.scopes)
+            currentUser = summary.user
+            authState = .signedIn(summary)
         } catch {
-            tokenStatusMessage = error.localizedDescription
+            mapAuthError(error)
         }
     }
 
-    func deleteToken() {
-        do {
-            try tokenStore.deleteToken()
-            settings.reloadTokenPresence()
-            tokenStatusMessage = "Removed the stored token."
-            currentUser = nil
-            authoredSource = []
-            reviewSource = []
-            workflowFailureSource = []
-            ciStatusCache = [:]
-            ciStatusesByPullRequestID = [:]
-            ciDebugSummariesByPullRequestID = [:]
-            notifiedWorkflowFailureIDs = []
-            activeWorkflowFailureAlertIDs = []
-            hasEstablishedWorkflowFailureBaseline = false
-            notifiedCIFailureIDs = []
-            activeCIFailureAlertIDs = []
-            hasEstablishedCIFailureBaseline = false
-            applySnapshot(newItemTracking: .reset)
-            statusMessage = "Add a GitHub PAT in Settings to load pull requests."
-        } catch {
-            tokenStatusMessage = error.localizedDescription
+    func openGitHubVerificationPage() {
+        guard case let .authorizing(authorization) = authState else {
+            return
+        }
+
+        copyVerificationCodeToPasteboard(authorization.userCode)
+        NSWorkspace.shared.open(authorization.browserURL)
+        authStatusMessage = "Verification code copied to the clipboard."
+    }
+
+    func openSSOAuthorization() {
+        let owners = ssoOwnerList()
+        for owner in owners {
+            guard let url = URL(string: "https://github.com/orgs/\(owner)/sso") else {
+                continue
+            }
+
+            NSWorkspace.shared.open(url)
         }
     }
 
-    func loadStoredToken() -> String {
-        (try? tokenStore.loadToken()) ?? ""
+    func openAppInstallationPage() {
+        guard let url = appInstallURL else {
+            return
+        }
+
+        NSWorkspace.shared.open(url)
     }
 
     func ciStatus(for item: PullRequestItem) -> PullRequestCIStatus {
@@ -229,7 +314,7 @@ final class InboxViewModel: ObservableObject {
     }
 
     func refreshCIStatuses(for items: [PullRequestItem]) async {
-        guard settings.hasStoredToken else {
+        guard authState.isAuthenticated else {
             return
         }
 
@@ -251,7 +336,7 @@ final class InboxViewModel: ObservableObject {
             return
         }
 
-        let client = makeClient()
+        let client = makeClient(scopes: settings.scopes)
         do {
             let snapshotsByItemID = try await client.fetchCIStatusSnapshots(for: uncachedItems)
 
@@ -377,10 +462,8 @@ final class InboxViewModel: ObservableObject {
         newlyWorkflowFailureIDs = workflowFailureNewItemTracker.newIDs
     }
 
-    private func makeClient() -> GitHubClient {
-        GitHubClient { [tokenStore] in
-            try tokenStore.loadToken()
-        }
+    private func makeClient(scopes: [RepositoryScope]) -> GitHubClient {
+        GitHubClient(authProvider: authProvider, scopes: scopes)
     }
 
     private func refreshCIStatusesForVisibleItems() async {
@@ -469,5 +552,99 @@ final class InboxViewModel: ObservableObject {
         )
 
         try? await notificationCenter.add(request)
+    }
+
+    private func clearLoadedData(resetStatus: Bool) {
+        authoredSource = []
+        reviewSource = []
+        workflowFailureSource = []
+        ciStatusCache = [:]
+        ciStatusesByPullRequestID = [:]
+        ciDebugSummariesByPullRequestID = [:]
+        activeCIFailureAlertIDs = []
+        notifiedCIFailureIDs = []
+        hasEstablishedCIFailureBaseline = false
+
+        if resetStatus {
+            notifiedWorkflowFailureIDs = []
+            activeWorkflowFailureAlertIDs = []
+            hasEstablishedWorkflowFailureBaseline = false
+        }
+
+        applySnapshot(newItemTracking: .reset)
+    }
+
+    private func copyVerificationCodeToPasteboard(_ code: String) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(code, forType: .string)
+    }
+
+    private func mapAuthError(_ error: Error) {
+        switch error {
+        case let authError as GitHubAuthError:
+            switch authError {
+            case let .missingConfiguration(message):
+                authState = .missingConfiguration(message)
+            case .signedOut:
+                authState = .signedOut
+                currentUser = nil
+            case .pendingAuthorizationRequired:
+                authState = .signedOut
+            case let .authorizationDenied(message),
+                 let .authorizationExpired(message),
+                 let .refreshFailed(message):
+                authState = .refreshFailed(message)
+            case let .ssoRequired(owners, message):
+                authState = .ssoRequired(owners.isEmpty ? watchedOwners() : owners, message)
+            case let .installationMissing(owners, repositories, message):
+                let identifiers = owners.isEmpty ? repositories : owners
+                authState = .installationMissing(identifiers, message)
+            case let .invalidResponse(message),
+                 let .network(message):
+                authState = .refreshFailed(message)
+            }
+            authStatusMessage = error.localizedDescription
+        default:
+            authState = .refreshFailed(error.localizedDescription)
+            authStatusMessage = error.localizedDescription
+        }
+    }
+
+    private func mapRefreshError(_ error: Error) {
+        if let clientError = error as? GitHubClientError {
+            switch clientError {
+            case let .unauthorized(message):
+                let owners = watchedOwners()
+                if message.lowercased().contains("sso") || message.lowercased().contains("single sign-on") {
+                    authState = .ssoRequired(owners, message)
+                } else {
+                    authState = .refreshFailed(message)
+                }
+            case let .configuration(message):
+                authState = .refreshFailed(message)
+            case let .invalidResponse(message),
+                 let .network(message):
+                authStatusMessage = message
+            case .missingToken:
+                authState = .signedOut
+            }
+            return
+        }
+
+        mapAuthError(error)
+    }
+
+    private func watchedOwners() -> [String] {
+        Array(Set(settings.scopes.map { $0.ownerName.lowercased() })).sorted()
+    }
+
+    private func ssoOwnerList() -> [String] {
+        switch authState {
+        case let .ssoRequired(owners, _):
+            return owners.isEmpty ? watchedOwners() : owners
+        default:
+            return watchedOwners()
+        }
     }
 }

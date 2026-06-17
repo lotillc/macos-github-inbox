@@ -11,6 +11,7 @@
 		383AE3AACFC16A3A5B29C99F /* Cocoa.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 76A69322B90127459C179AC6 /* Cocoa.framework */; };
 		4EE88259EF214C7088E8C065 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 47BA270AC39C7BF973BA20D3 /* SettingsView.swift */; };
 		5746C5CAFDDEA2485BCD8513 /* LaunchAtLoginManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB34F93C53721ECBE683BBA0 /* LaunchAtLoginManager.swift */; };
+		73182E4DBE3A9E5D4FBA5A11 /* GitHubAuth.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6A835B63AA96D08E3DA0A00F /* GitHubAuth.swift */; };
 		7EC64CC564EA4BEC7A719521 /* GitHubSearchQueryBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 71CD880C4EA1623D38D57DB3 /* GitHubSearchQueryBuilder.swift */; };
 		80892B867B92C0CBD8D5710B /* InboxViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 28C9989335E8B201B7AD85FE /* InboxViewModel.swift */; };
 		96F8AEE842DCB372A0A3F5BC /* KeychainTokenStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 49152CDAB96DBBDCFB63D0DE /* KeychainTokenStore.swift */; };
@@ -31,6 +32,7 @@
 		47BA270AC39C7BF973BA20D3 /* SettingsView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = SettingsView.swift; path = Sources/GitHubPRInbox/SettingsView.swift; sourceTree = "<group>"; };
 		49152CDAB96DBBDCFB63D0DE /* KeychainTokenStore.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = KeychainTokenStore.swift; path = Sources/GitHubPRInbox/KeychainTokenStore.swift; sourceTree = "<group>"; };
 		5E4B079F2DF14FC1E8BB0F0D /* SettingsWindowController.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = SettingsWindowController.swift; path = Sources/GitHubPRInbox/SettingsWindowController.swift; sourceTree = "<group>"; };
+		6A835B63AA96D08E3DA0A00F /* GitHubAuth.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = GitHubAuth.swift; path = Sources/GitHubPRInbox/Auth/GitHubAuth.swift; sourceTree = "<group>"; };
 		71CD880C4EA1623D38D57DB3 /* GitHubSearchQueryBuilder.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = GitHubSearchQueryBuilder.swift; path = Sources/GitHubPRInbox/GitHubSearchQueryBuilder.swift; sourceTree = "<group>"; };
 		76A69322B90127459C179AC6 /* Cocoa.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Cocoa.framework; path = Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.0.sdk/System/Library/Frameworks/Cocoa.framework; sourceTree = DEVELOPER_DIR; };
 		A7C654EB494BEC1FE30FB1F7 /* GitHubPRInbox.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = GitHubPRInbox.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -64,6 +66,7 @@
 			children = (
 				107CA79B5D9B7268CB83D801 /* AllowlistParser.swift */,
 				1D4DD1640303AA165EA3193F /* AppSettings.swift */,
+				6A835B63AA96D08E3DA0A00F /* GitHubAuth.swift */,
 				C446BE57CA0827CDF52B2078 /* GitHubClient.swift */,
 				FE51D7D5E99683A8EA3942B6 /* GitHubPRInboxApp.swift */,
 				71CD880C4EA1623D38D57DB3 /* GitHubSearchQueryBuilder.swift */,
@@ -177,6 +180,7 @@
 			files = (
 				E866463D64D3B4CF2C867D5A /* AllowlistParser.swift in Sources */,
 				D661D0543579820E5C463810 /* AppSettings.swift in Sources */,
+				73182E4DBE3A9E5D4FBA5A11 /* GitHubAuth.swift in Sources */,
 				23C2EEE421D37FC93E677316 /* GitHubClient.swift in Sources */,
 				9D20E7EDC2E49E8188AE7677 /* GitHubPRInboxApp.swift in Sources */,
 				7EC64CC564EA4BEC7A719521 /* GitHubSearchQueryBuilder.swift in Sources */,
@@ -320,6 +324,9 @@
 				ENABLE_HARDENED_RUNTIME = NO;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = GitHubPRInbox;
+				INFOPLIST_KEY_GitHubAppClientID = "$(GITHUB_APP_CLIENT_ID)";
+				INFOPLIST_KEY_GitHubAppExpectedOwners = "$(GITHUB_APP_EXPECTED_OWNERS)";
+				INFOPLIST_KEY_GitHubAppSlug = "$(GITHUB_APP_SLUG)";
 				INFOPLIST_KEY_LSUIElement = YES;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/../Frameworks";
@@ -328,6 +335,9 @@
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = macosx;
 				SWIFT_EMIT_LOC_STRINGS = NO;
+				GITHUB_APP_CLIENT_ID = "";
+				GITHUB_APP_EXPECTED_OWNERS = "";
+				GITHUB_APP_SLUG = "";
 				SWIFT_VERSION = 6.0;
 			};
 			name = Debug;
@@ -344,6 +354,9 @@
 				ENABLE_HARDENED_RUNTIME = NO;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = GitHubPRInbox;
+				INFOPLIST_KEY_GitHubAppClientID = "$(GITHUB_APP_CLIENT_ID)";
+				INFOPLIST_KEY_GitHubAppExpectedOwners = "$(GITHUB_APP_EXPECTED_OWNERS)";
+				INFOPLIST_KEY_GitHubAppSlug = "$(GITHUB_APP_SLUG)";
 				INFOPLIST_KEY_LSUIElement = YES;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/../Frameworks";
@@ -352,6 +365,9 @@
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = macosx;
 				SWIFT_EMIT_LOC_STRINGS = NO;
+				GITHUB_APP_CLIENT_ID = "";
+				GITHUB_APP_EXPECTED_OWNERS = "";
+				GITHUB_APP_SLUG = "";
 				SWIFT_VERSION = 6.0;
 			};
 			name = Release;
