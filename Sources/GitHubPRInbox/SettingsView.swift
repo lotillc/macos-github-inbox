@@ -6,7 +6,6 @@ struct SettingsView: View {
     @ObservedObject var settings: AppSettings
     @ObservedObject var launchAtLoginManager: LaunchAtLoginManager
 
-    @State private var tokenText = ""
     @State private var allowlistDraft = ""
     @State private var trackedWorkflowsDraft = ""
 
@@ -25,9 +24,8 @@ struct SettingsView: View {
             .padding(24)
         }
         .background(Color(nsColor: .windowBackgroundColor))
-        .frame(minWidth: 600, minHeight: 520)
+        .frame(minWidth: 620, minHeight: 560)
         .task {
-            tokenText = model.loadStoredToken()
             allowlistDraft = settings.allowlistText
             trackedWorkflowsDraft = settings.trackedWorkflowNamesText
         }
@@ -38,40 +36,183 @@ struct SettingsView: View {
             Text("Settings")
                 .font(.title2.weight(.semibold))
 
-            Text("Minimal controls for what to watch, how often to refresh, and when to alert.")
+            Text("Choose what to watch, manage GitHub sign-in, and control refresh behavior.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
     }
 
     private var accountSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 12) {
             sectionLabel("Account")
 
-            SecureField("GitHub fine-grained PAT", text: $tokenText)
-                .textFieldStyle(.roundedBorder)
+            switch model.authState {
+            case let .missingConfiguration(message):
+                authMessage(message, tone: .warning)
 
-            HStack(spacing: 10) {
-                Button("Save") {
-                    Task {
-                        await model.saveToken(tokenText)
+            case .signedOut:
+                Text("Sign in with the installed GitHub App to load pull requests and workflow failures.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                HStack(spacing: 10) {
+                    Button("Sign In with GitHub") {
+                        Task {
+                            await model.beginSignIn()
+                        }
+                    }
+
+                    Spacer()
+
+                    Text(settings.hasStoredCredentials ? "Stored session" : "No session")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+            case let .authorizing(authorization):
+                Text("Finish sign-in in your browser, then return here while the app waits for authorization.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Verification Code")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+
+                    Text(authorization.userCode)
+                        .font(.system(size: 28, weight: .bold, design: .monospaced))
+                        .textSelection(.enabled)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(.quaternary.opacity(0.5))
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+
+                    Text("Open \(authorization.verificationURL.absoluteString) and enter the code if GitHub does not auto-fill it.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                HStack(spacing: 10) {
+                    Button("Open GitHub Verification Page") {
+                        model.openGitHubVerificationPage()
+                    }
+
+                    Button("Cancel", role: .destructive) {
+                        model.cancelSignIn()
+                    }
+
+                    Spacer()
+
+                    Text(settings.hasStoredCredentials ? "Stored session" : "No session")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+            case let .signedIn(summary):
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("@\(summary.user.login)")
+                        .font(.headline)
+
+                    if let tokenExpiresAt = summary.tokenExpiresAt {
+                        Text("Access token expires \(tokenExpiresAt.formatted(date: .abbreviated, time: .shortened)).")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    if !summary.authorizedOwners.isEmpty {
+                        Text("Authorized owners: \(summary.authorizedOwners.joined(separator: ", "))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                 }
 
-                Button("Remove", role: .destructive) {
-                    model.deleteToken()
-                    tokenText = ""
+                HStack(spacing: 10) {
+                    Button("Reconnect") {
+                        Task {
+                            await model.beginSignIn()
+                        }
+                    }
+
+                    Button("Refresh Auth Status") {
+                        Task {
+                            await model.refreshAuthStatus()
+                        }
+                    }
+
+                    Button("Sign Out", role: .destructive) {
+                        model.signOut()
+                    }
+
+                    Spacer()
+
+                    Text(settings.hasStoredCredentials ? "Keychain" : "No session")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
 
-                Spacer()
+            case let .refreshFailed(message):
+                authMessage(message, tone: .warning)
 
-                Text(settings.hasStoredToken ? "Keychain" : "No token")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                HStack(spacing: 10) {
+                    Button("Reconnect") {
+                        Task {
+                            await model.beginSignIn()
+                        }
+                    }
+
+                    Button("Sign Out", role: .destructive) {
+                        model.signOut()
+                    }
+                }
+
+            case let .ssoRequired(_, message):
+                authMessage(message, tone: .warning)
+
+                HStack(spacing: 10) {
+                    Button("Open Org SSO") {
+                        model.openSSOAuthorization()
+                    }
+
+                    Button("Retry Auth Check") {
+                        Task {
+                            await model.refreshAuthStatus()
+                        }
+                    }
+
+                    Button("Reconnect") {
+                        Task {
+                            await model.beginSignIn()
+                        }
+                    }
+                }
+
+            case let .installationMissing(_, message):
+                authMessage(message, tone: .warning)
+
+                HStack(spacing: 10) {
+                    if model.appInstallURL != nil {
+                        Button("Open App Install Page") {
+                            model.openAppInstallationPage()
+                        }
+                    }
+
+                    Button("Retry Auth Check") {
+                        Task {
+                            await model.refreshAuthStatus()
+                        }
+                    }
+
+                    Button("Reconnect") {
+                        Task {
+                            await model.beginSignIn()
+                        }
+                    }
+                }
             }
 
-            if let tokenStatusMessage = model.tokenStatusMessage {
-                Text(tokenStatusMessage)
+            if let authStatusMessage = model.authStatusMessage {
+                Text(authStatusMessage)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -100,6 +241,7 @@ struct SettingsView: View {
                 Button("Apply") {
                     settings.allowlistText = allowlistDraft
                     Task {
+                        await model.refreshAuthStatus()
                         await model.refresh()
                     }
                 }
@@ -202,6 +344,25 @@ struct SettingsView: View {
         }
     }
 
+    private enum AuthMessageTone {
+        case warning
+        case neutral
+    }
+
+    private func authMessage(_ message: String, tone: AuthMessageTone) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: tone == .warning ? "exclamationmark.triangle.fill" : "info.circle.fill")
+                .foregroundStyle(tone == .warning ? Color.yellow : Color.accentColor)
+
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(10)
+        .background(.quaternary.opacity(0.45))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+
     private func sectionLabel(_ title: String) -> some View {
         Text(title)
             .font(.headline)
@@ -219,13 +380,11 @@ struct SettingsView: View {
     private func twoColumnRow<Content: View>(label: String, @ViewBuilder content: () -> Content) -> some View {
         HStack(alignment: .center) {
             Text(label)
+                .frame(width: 90, alignment: .leading)
                 .foregroundStyle(.secondary)
-                .frame(width: 72, alignment: .leading)
 
             content()
-
-            Spacer()
         }
-        .font(.subheadline)
+        .font(.caption)
     }
 }

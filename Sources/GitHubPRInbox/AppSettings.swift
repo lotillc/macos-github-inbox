@@ -50,7 +50,7 @@ final class AppSettings: ObservableObject {
         }
     }
 
-    @Published private(set) var hasStoredToken: Bool
+    @Published private(set) var hasStoredCredentials: Bool
 
     static let defaultRefreshIntervalMinutes = 5
     static let supportedRefreshIntervals = [1, 5, 10, 15, 30, 60]
@@ -78,7 +78,7 @@ final class AppSettings: ObservableObject {
         sortOption = PullRequestSortOption(rawValue: storedSortOption) ?? .recentlyUpdatedFirst
 
         launchAtLoginRequested = userDefaults.bool(forKey: Keys.launchAtLoginRequested)
-        hasStoredToken = tokenStore.hasToken()
+        hasStoredCredentials = tokenStore.hasCredentials()
     }
 
     var scopes: [RepositoryScope] {
@@ -102,7 +102,7 @@ final class AppSettings: ObservableObject {
         }
     }
 
-    func reloadTokenPresence() {
-        hasStoredToken = tokenStore.hasToken()
+    func reloadCredentialPresence() {
+        hasStoredCredentials = tokenStore.hasCredentials()
     }
 }

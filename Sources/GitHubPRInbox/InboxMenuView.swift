@@ -211,9 +211,23 @@ struct InboxMenuView: View {
             Text("Finish Setup")
                 .font(.subheadline.weight(.semibold))
 
-            if !settings.hasStoredToken {
-                Text("Add a fine-grained GitHub PAT in Settings.")
+            switch model.authState {
+            case let .missingConfiguration(message):
+                Text(message)
                     .foregroundStyle(.secondary)
+            case .signedOut:
+                Text("Sign in with GitHub in Settings.")
+                    .foregroundStyle(.secondary)
+            case .authorizing:
+                Text("Finish GitHub sign-in in Settings.")
+                    .foregroundStyle(.secondary)
+            case let .refreshFailed(message),
+                 let .ssoRequired(_, message),
+                 let .installationMissing(_, message):
+                Text(message)
+                    .foregroundStyle(.secondary)
+            case .signedIn:
+                EmptyView()
             }
 
             if settings.scopes.isEmpty {
@@ -377,7 +391,7 @@ struct InboxMenuView: View {
             "\(model.hasConfigurationIssue)",
             model.statusMessage ?? "",
             "\(currentVisibleRowLimit())",
-            "\(settings.hasStoredToken)",
+            "\(settings.hasStoredCredentials)",
             "\(settings.scopes.count)",
         ].joined(separator: "|")
     }

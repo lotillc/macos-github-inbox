@@ -11,7 +11,7 @@ It is built for people who live in GitHub all day and want a compact triage surf
 ## Features
 
 - Native `MenuBarExtra` UI
-- Fine-grained GitHub PAT stored in macOS Keychain
+- GitHub App device-flow sign-in stored in macOS Keychain
 - Review queue, authored queue, and workflow failure queue
 - CI status indicators on PR rows
 - New-item markers since last open
@@ -27,12 +27,22 @@ It is built for people who live in GitHub all day and want a compact triage surf
 
 - macOS 14+
 - Xcode 16+
-- A GitHub fine-grained personal access token with:
+- A GitHub App installed on the org or account that owns the repositories you want to watch
+- GitHub App permissions:
   - `Pull requests: Read`
   - `Commit statuses: Read`
-  - `Actions: Read` for workflow failure tracking
+  - `Checks: Read`
+  - `Actions: Read`
+- GitHub App configuration:
+  - Device flow enabled
+  - Client ID
+  - App slug
+- App configuration values set through Xcode build settings or environment:
+  - `GITHUB_APP_CLIENT_ID`
+  - `GITHUB_APP_SLUG`
+  - Optional: `GITHUB_APP_EXPECTED_OWNERS` as a comma-separated list
 
-Depending on how your org publishes CI, `Checks` access may also be relevant, but the app falls back to commit status data where possible.
+If your org uses SAML SSO, you must also have an active SSO session for the org before authorizing the app.
 
 ## Install
 
@@ -43,6 +53,15 @@ open GitHubPRInbox.xcodeproj
 ```
 
 Then run the `GitHubPRInbox` scheme on `My Mac`.
+
+Before running locally, set the GitHub App values in the target build settings or export them in the shell that launches Xcode:
+
+```bash
+export GITHUB_APP_CLIENT_ID=Iv1.your_client_id
+export GITHUB_APP_SLUG=your-app-slug
+export GITHUB_APP_EXPECTED_OWNERS=acme
+open GitHubPRInbox.xcodeproj
+```
 
 ### From release
 

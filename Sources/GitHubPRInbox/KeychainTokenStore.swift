@@ -17,16 +17,47 @@ enum KeychainStoreError: LocalizedError {
 
 struct KeychainTokenStore {
     static let shared = KeychainTokenStore(
-        service: "com.github-pr-inbox.token",
-        account: "github-personal-access-token"
+        service: "com.github-pr-inbox.github-app-auth",
+        account: "github-app-device-flow-credential"
     )
 
     let service: String
     let account: String
 
-    func save(token: String) throws {
-        let encodedToken = Data(token.utf8)
+    func saveCredential(_ credential: GitHubCredential) throws {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let encodedCredential = try encoder.encode(credential)
+        try save(data: encodedCredential)
+    }
 
+    func loadCredential() throws -> GitHubCredential? {
+        guard let data = try loadData() else {
+            return nil
+        }
+
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+
+        do {
+            return try decoder.decode(GitHubCredential.self, from: data)
+        } catch {
+            throw KeychainStoreError.invalidData
+        }
+    }
+
+    func deleteCredential() throws {
+        let status = SecItemDelete(baseQuery as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw KeychainStoreError.unexpectedStatus(status)
+        }
+    }
+
+    func hasCredentials() -> Bool {
+        (try? loadCredential()) != nil
+    }
+
+    private func save(data: Data) throws {
         let query = baseQuery as CFDictionary
         SecItemDelete(query)
 
@@ -34,7 +65,7 @@ struct KeychainTokenStore {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
-            kSecValueData as String: encodedToken,
+            kSecValueData as String: data,
         ]
 
         let status = SecItemAdd(attributes as CFDictionary, nil)
@@ -43,7 +74,7 @@ struct KeychainTokenStore {
         }
     }
 
-    func loadToken() throws -> String {
+    private func loadData() throws -> Data? {
         var query = baseQuery
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -55,27 +86,16 @@ struct KeychainTokenStore {
         case errSecSuccess:
             break
         case errSecItemNotFound:
-            return ""
+            return nil
         default:
             throw KeychainStoreError.unexpectedStatus(status)
         }
 
-        guard let data = result as? Data, let token = String(data: data, encoding: .utf8) else {
+        guard let data = result as? Data else {
             throw KeychainStoreError.invalidData
         }
 
-        return token
-    }
-
-    func deleteToken() throws {
-        let status = SecItemDelete(baseQuery as CFDictionary)
-        guard status == errSecSuccess || status == errSecItemNotFound else {
-            throw KeychainStoreError.unexpectedStatus(status)
-        }
-    }
-
-    func hasToken() -> Bool {
-        ((try? loadToken().isEmpty) == false)
+        return data
     }
 
     private var baseQuery: [String: Any] {
