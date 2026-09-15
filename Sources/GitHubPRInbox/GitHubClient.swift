@@ -216,7 +216,7 @@ actor GitHubClient {
 
     private let session: URLSession
     private let tokenProvider: @Sendable () async throws -> String
-    private let refreshTokenProvider: (@Sendable () async throws -> String)?
+    private let refreshTokenProvider: (@Sendable (String) async throws -> String)?
     private let decoder: JSONDecoder
 
     private enum PullRequestReviewGateState {
@@ -243,7 +243,27 @@ actor GitHubClient {
     ) {
         self.session = session
         self.tokenProvider = tokenProvider
-        self.refreshTokenProvider = refreshTokenProvider
+        if let refreshTokenProvider {
+            self.refreshTokenProvider = { _ in
+                try await refreshTokenProvider()
+            }
+        } else {
+            self.refreshTokenProvider = nil
+        }
+
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        self.decoder = decoder
+    }
+
+    init(
+        session: URLSession = .shared,
+        tokenProvider: @escaping @Sendable () async throws -> String,
+        refreshAfterUnauthorized: @escaping @Sendable (String) async throws -> String
+    ) {
+        self.session = session
+        self.tokenProvider = tokenProvider
+        self.refreshTokenProvider = refreshAfterUnauthorized
 
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
@@ -258,7 +278,12 @@ actor GitHubClient {
         self.init(
             session: session,
             tokenProvider: { try await authProvider.validAccessToken(expectedScopes: scopes) },
-            refreshTokenProvider: { try await authProvider.forceRefresh(expectedScopes: scopes).accessToken }
+            refreshAfterUnauthorized: { rejectedToken in
+                try await authProvider.refreshAfterUnauthorized(
+                    rejectedAccessToken: rejectedToken,
+                    expectedScopes: scopes
+                )
+            }
         )
     }
 
@@ -564,7 +589,16 @@ actor GitHubClient {
                    allowRetry,
                    let refreshTokenProvider
                 {
-                    let refreshedToken = try await refreshTokenProvider()
+                    guard let authorization = request.value(forHTTPHeaderField: "Authorization"),
+                          authorization.hasPrefix("Bearer ")
+                    else {
+                        throw GitHubClientError.missingToken
+                    }
+                    let rejectedToken = String(authorization.dropFirst("Bearer ".count))
+                    guard !rejectedToken.isEmpty else {
+                        throw GitHubClientError.missingToken
+                    }
+                    let refreshedToken = try await refreshTokenProvider(rejectedToken)
                     guard !refreshedToken.isEmpty else {
                         throw GitHubClientError.missingToken
                     }

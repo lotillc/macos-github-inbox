@@ -836,6 +836,32 @@ actor GitHubAuthProvider {
         )
     }
 
+    func refreshAfterUnauthorized(
+        rejectedAccessToken: String,
+        expectedScopes: [RepositoryScope]
+    ) async throws -> String {
+        let context = try configuredContext()
+        let configuration = context.configuration
+
+        // GitHubClient obtains a token through `validAccessToken`, which
+        // resolves any pending device credential before sending the request.
+        // Keep the comparison and refresh-task registration in this actor so
+        // a late 401 for T0 cannot refresh a newly persisted T1.
+        guard let credential = try loadActiveCredentialBoundToCurrentApp() else {
+            throw GitHubAuthError.signedOut
+        }
+        guard credential.accessToken == rejectedAccessToken else {
+            return credential.accessToken
+        }
+
+        return try await refreshCredential(
+            credential,
+            expectedScopes: expectedScopes,
+            configuration: configuration,
+            context: context
+        ).accessToken
+    }
+
     func validAccessToken(expectedScopes: [RepositoryScope]) async throws -> String {
         try await refreshIfNeeded(expectedScopes: expectedScopes).accessToken
     }

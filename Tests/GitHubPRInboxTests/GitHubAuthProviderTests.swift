@@ -628,6 +628,64 @@ struct GitHubAuthProviderTests {
     }
 
     @Test
+    func lateUnauthorizedResponsesReuseTheAlreadyRotatedAccessToken() async throws {
+        let store = KeychainTokenStore(
+            service: "com.github-pr-inbox.tests.\(UUID().uuidString)",
+            account: "late-unauthorized-refresh"
+        )
+        defer { try? store.deleteCredential() }
+        try store.saveCredential(testCredential())
+
+        let refreshStarted = DispatchSemaphore(value: 0)
+        let releaseRefresh = DispatchSemaphore(value: 0)
+        let refreshRequests = LockedRequestCounter()
+        let session = makeMockSession { request in
+            let url = try #require(request.url)
+            switch (url.host, url.path) {
+            case ("github.com", "/login/oauth/access_token"):
+                refreshRequests.increment()
+                refreshStarted.signal()
+                guard releaseRefresh.wait(timeout: .now() + 5) == .success else {
+                    throw NSError(domain: "MockURLProtocol", code: 39)
+                }
+                return jsonResponse(statusCode: 200, body: #"{ "access_token": "ghu_rotated", "refresh_token": "ghr_rotated", "expires_in": 28800 }"#)
+            case ("api.github.com", "/user"):
+                return jsonResponse(statusCode: 200, body: #"{ "id": 7, "login": "mona" }"#)
+            case ("api.github.com", "/user/installations"):
+                return jsonResponse(statusCode: 200, body: #"{ "installations": [] }"#)
+            default:
+                throw NSError(domain: "MockURLProtocol", code: 40)
+            }
+        }
+        let provider = testProvider(session: session, store: store)
+
+        let first = Task {
+            try await provider.refreshAfterUnauthorized(
+                rejectedAccessToken: "ghu_current",
+                expectedScopes: []
+            )
+        }
+        #expect(await waitForSemaphore(refreshStarted, timeout: 2) == .success)
+        let concurrent = Task {
+            try await provider.refreshAfterUnauthorized(
+                rejectedAccessToken: "ghu_current",
+                expectedScopes: []
+            )
+        }
+        releaseRefresh.signal()
+
+        #expect(try await first.value == "ghu_rotated")
+        #expect(try await concurrent.value == "ghu_rotated")
+        #expect(
+            try await provider.refreshAfterUnauthorized(
+                rejectedAccessToken: "ghu_current",
+                expectedScopes: []
+            ) == "ghu_rotated"
+        )
+        #expect(refreshRequests.value == 1)
+    }
+
+    @Test
     func reportsClientHTTP429AsRetryableRateLimit() async throws {
         let session = makeMockSession { _ in
             jsonResponse(statusCode: 429, body: #"{ "message": "slow down" }"#, headers: ["Retry-After": "60"])
@@ -1509,6 +1567,33 @@ struct GitHubAuthProviderTests {
     }
 
     @Test
+    func gitHubClientDoesNotRefreshAgainForALateStaleUnauthorizedResponse() async throws {
+        let session = makeMockSession { request in
+            switch request.value(forHTTPHeaderField: "Authorization") {
+            case "Bearer stale-token":
+                return jsonResponse(statusCode: 401, body: #"{ "message": "Bad credentials" }"#)
+            case "Bearer fresh-token":
+                return jsonResponse(statusCode: 200, body: #"{ "login": "mona" }"#)
+            default:
+                throw NSError(domain: "MockURLProtocol", code: 38)
+            }
+        }
+        let refreshState = TokenRefreshState()
+        let client = GitHubClient(
+            session: session,
+            tokenProvider: { "stale-token" },
+            refreshAfterUnauthorized: { rejectedToken in
+                try await refreshState.refreshIfNeeded(afterRejecting: rejectedToken)
+            }
+        )
+
+        _ = try await client.validateToken()
+        _ = try await client.validateToken()
+
+        #expect(await refreshState.refreshCount() == 1)
+    }
+
+    @Test
     func gitHubClientPreservesAuthenticationErrorsFromForcedRefresh() async throws {
         let session = makeMockSession { _ in
             jsonResponse(statusCode: 401, body: #"{ "message": "Bad credentials" }"#)
@@ -1726,6 +1811,24 @@ private actor RefreshTracker {
 
     func didRefresh() -> Bool {
         refreshed
+    }
+}
+
+private actor TokenRefreshState {
+    private var token = "stale-token"
+    private var count = 0
+
+    func refreshIfNeeded(afterRejecting rejectedToken: String) throws -> String {
+        guard token == rejectedToken else {
+            return token
+        }
+        count += 1
+        token = "fresh-token"
+        return token
+    }
+
+    func refreshCount() -> Int {
+        count
     }
 }
 
