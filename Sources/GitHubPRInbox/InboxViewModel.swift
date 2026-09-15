@@ -25,6 +25,7 @@ final class InboxViewModel: ObservableObject {
     private let authProvider: GitHubAuthProvider
     private let clientSession: URLSession
     private var lastKnownSessionSummary: GitHubSessionSummary?
+    private var hasOwnerClassification = false
     private var authoredSource: [PullRequestItem] = []
     private var reviewSource: [PullRequestItem] = []
     private var workflowFailureSource: [WorkflowFailureItem] = []
@@ -120,10 +121,16 @@ final class InboxViewModel: ObservableObject {
     }
 
     var availableOrganizationOwners: [String] {
-        repositoryInventorySummary?.organizationOwners.sorted() ?? []
+        guard hasOwnerClassification else {
+            return []
+        }
+        return repositoryInventorySummary?.organizationOwners.sorted() ?? []
     }
 
     var availablePersonalAccountOwners: [String] {
+        guard hasOwnerClassification else {
+            return []
+        }
         let organizations = Set(availableOrganizationOwners.map { $0.lowercased() })
         return availableRepositoryOwners.filter { !organizations.contains($0.lowercased()) }
     }
@@ -341,6 +348,7 @@ final class InboxViewModel: ObservableObject {
                 settings.reloadCredentialPresence()
                 currentUser = nil
                 lastKnownSessionSummary = nil
+                hasOwnerClassification = false
                 authState = .signedOut
                 authStatusMessage = "Signed out of GitHub."
                 statusMessage = "Sign in with GitHub in Settings to load pull requests."
@@ -387,7 +395,7 @@ final class InboxViewModel: ObservableObject {
                     return
                 }
                 currentUser = summary.user
-                setAuthenticatedSession(summary)
+                setAuthenticatedSession(summary, ownerClassificationKnown: true)
                 settings.reloadCredentialPresence()
                 return
             }
@@ -397,6 +405,10 @@ final class InboxViewModel: ObservableObject {
             }
 
             currentUser = GitHubUser(login: credential.userLogin)
+            // Credentials written by older versions lack this classification.
+            // Validate them before showing owner controls so organizations are
+            // never misrepresented as personal accounts.
+            let needsOwnerClassification = credential.organizationOwners == nil
             let credentialSummary = GitHubSessionSummary(
                 user: GitHubUser(login: credential.userLogin),
                 tokenExpiresAt: credential.accessTokenExpiresAt,
@@ -412,19 +424,21 @@ final class InboxViewModel: ObservableObject {
                 lastKnownSessionSummary = credentialSummary
             }
 
-            if settings.scopes.isEmpty && configuration.expectedOwners.isEmpty {
-                setAuthenticatedSession(credentialSummary)
+            if !needsOwnerClassification,
+               settings.scopes.isEmpty && configuration.expectedOwners.isEmpty {
+                setAuthenticatedSession(credentialSummary, ownerClassificationKnown: true)
                 return
             }
 
-            if !forceValidation,
+            if !needsOwnerClassification,
+               !forceValidation,
                canUseCachedValidation(
                    credential,
                    expectedScopes: settings.scopes,
                    configuration: configuration
                )
             {
-                setAuthenticatedSession(credentialSummary)
+                setAuthenticatedSession(credentialSummary, ownerClassificationKnown: true)
                 return
             }
 
@@ -433,7 +447,7 @@ final class InboxViewModel: ObservableObject {
                 return
             }
             currentUser = summary.user
-            setAuthenticatedSession(summary)
+            setAuthenticatedSession(summary, ownerClassificationKnown: true)
         } catch {
             guard isCurrentConnection(generation) else {
                 return
@@ -541,6 +555,7 @@ final class InboxViewModel: ObservableObject {
         if appIdentityChanged {
             currentUser = nil
             lastKnownSessionSummary = nil
+            hasOwnerClassification = false
             authState = .signedOut
             authStatusMessage = "GitHub App changed. Reconnect to GitHub."
             statusMessage = "Sign in with GitHub in Settings to load pull requests."
@@ -1011,8 +1026,14 @@ final class InboxViewModel: ObservableObject {
         return false
     }
 
-    private func setAuthenticatedSession(_ summary: GitHubSessionSummary) {
+    private func setAuthenticatedSession(
+        _ summary: GitHubSessionSummary,
+        ownerClassificationKnown: Bool? = nil
+    ) {
         lastKnownSessionSummary = summary
+        if let ownerClassificationKnown {
+            hasOwnerClassification = ownerClassificationKnown
+        }
         authState = .signedIn(summary)
     }
 
@@ -1059,6 +1080,7 @@ final class InboxViewModel: ObservableObject {
                 authState = .signedOut
                 currentUser = nil
                 lastKnownSessionSummary = nil
+                hasOwnerClassification = false
             case .pendingAuthorizationRequired:
                 authState = .signedOut
             case let .authorizationDenied(message),

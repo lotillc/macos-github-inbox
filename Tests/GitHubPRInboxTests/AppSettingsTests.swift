@@ -422,6 +422,70 @@ struct AppSettingsTests {
         }
         #expect(model.availableRepositoryNames == ["acme/backend"])
         #expect(model.availableRepositoryOwners == ["acme"])
+        #expect(model.availableOrganizationOwners.isEmpty)
+        #expect(model.availablePersonalAccountOwners.isEmpty)
+    }
+
+    @Test
+    func validatesLegacyCredentialOwnerClassificationBeforeShowingOwnerControls() async throws {
+        let tokenStore = testTokenStore(account: "legacy-owner-classification")
+        defer { try? tokenStore.deleteCredential() }
+        let settings = makeSettings(
+            account: "legacy-owner-classification",
+            tokenStore: tokenStore,
+            configuration: GitHubAuthConfiguration(clientID: "", appSlug: "", expectedOwners: [])
+        )
+        let session = makeSettingsMockSession { request in
+            let url = try #require(request.url)
+            switch (url.host, url.path) {
+            case ("api.github.com", "/user/installations"):
+                return settingsJSONResponse(
+                    statusCode: 200,
+                    body: #"{ "installations": [{ "id": 1, "account": { "login": "acme", "type": "Organization" }, "repository_selection": "all" }] }"#
+                )
+            case ("api.github.com", "/user/installations/1/repositories"):
+                return settingsJSONResponse(
+                    statusCode: 200,
+                    body: #"{ "repositories": [{ "full_name": "acme/backend" }] }"#
+                )
+            default:
+                throw NSError(domain: "SettingsMockURLProtocol", code: 22)
+            }
+        }
+        let provider = GitHubAuthProvider(
+            configuration: settings.gitHubAppConfiguration,
+            session: session,
+            tokenStore: tokenStore
+        )
+        let model = InboxViewModel(settings: settings, authProvider: provider)
+        guard await waitForMissingConfiguration(in: model, timeout: 2) else {
+            Issue.record("The initial refresh did not finish with the intentionally missing configuration.")
+            return
+        }
+
+        _ = try settings.saveGitHubAppConfiguration(
+            clientID: "Iv1.test",
+            appSlug: "test-app",
+            expectedOwner: ""
+        )
+        try tokenStore.saveCredential(
+            GitHubCredential(
+                accessToken: "ghu_test",
+                refreshToken: "ghr_test",
+                accessTokenExpiresAt: Date().addingTimeInterval(60 * 60),
+                refreshTokenExpiresAt: Date().addingTimeInterval(60 * 60 * 24),
+                userID: 7,
+                userLogin: "mona",
+                authorizedOwners: ["acme"],
+                accessibleRepositories: ["acme/backend"],
+                lastValidatedAt: Date()
+            )
+        )
+
+        await model.refreshAuthStatus()
+
+        #expect(model.availableOrganizationOwners == ["acme"])
+        #expect(model.availablePersonalAccountOwners.isEmpty)
     }
 
     @Test

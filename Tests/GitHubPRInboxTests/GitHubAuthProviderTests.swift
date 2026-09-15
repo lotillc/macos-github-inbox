@@ -764,6 +764,149 @@ struct GitHubAuthProviderTests {
     }
 
     @Test
+    func changingExpectedOwnersPreservesAnInFlightRotatedRefreshToken() async throws {
+        let store = KeychainTokenStore(
+            service: "com.github-pr-inbox.tests.\(UUID().uuidString)",
+            account: "expected-owner-refresh-race"
+        )
+        defer { try? store.deleteCredential() }
+        let credential = GitHubCredential(
+            accessToken: "ghu_expired",
+            refreshToken: "ghr_old",
+            accessTokenExpiresAt: Date().addingTimeInterval(-60),
+            refreshTokenExpiresAt: Date().addingTimeInterval(60 * 60),
+            userID: 7,
+            userLogin: "mona",
+            authorizedOwners: [],
+            accessibleRepositories: [],
+            lastValidatedAt: nil
+        )
+        try store.saveCredential(credential)
+
+        let refreshStarted = DispatchSemaphore(value: 0)
+        let allowRefresh = DispatchSemaphore(value: 0)
+        let session = makeMockSession { request in
+            let url = try #require(request.url)
+            switch (url.host, url.path) {
+            case ("github.com", "/login/oauth/access_token"):
+                refreshStarted.signal()
+                #expect(allowRefresh.wait(timeout: .now() + 5) == .success)
+                return jsonResponse(
+                    statusCode: 200,
+                    body: #"{ "access_token": "ghu_rotated", "refresh_token": "ghr_rotated", "expires_in": 28800 }"#
+                )
+            case ("api.github.com", "/user"):
+                return jsonResponse(statusCode: 200, body: #"{ "id": 7, "login": "mona" }"#)
+            case ("api.github.com", "/user/installations"):
+                return jsonResponse(
+                    statusCode: 200,
+                    body: #"{ "installations": [{ "id": 1, "account": { "login": "other-org", "type": "Organization" }, "repository_selection": "all" }] }"#
+                )
+            case ("api.github.com", "/user/installations/1/repositories"):
+                return jsonResponse(statusCode: 200, body: #"{ "repositories": [] }"#)
+            default:
+                throw NSError(domain: "MockURLProtocol", code: 23)
+            }
+        }
+        let provider = testProvider(session: session, store: store)
+        let refresh = Task { try await provider.refreshIfNeeded(expectedScopes: []) }
+        #expect(await waitForSemaphore(refreshStarted, timeout: 2) == .success)
+
+        await provider.updateConfiguration(
+            GitHubAuthConfiguration(
+                clientID: "Iv1.test",
+                appSlug: "github-pr-inbox",
+                expectedOwners: ["other-org"]
+            )
+        )
+        let newConfigurationValidation = Task {
+            try await provider.validateOrgAccess(expectedScopes: [])
+        }
+        allowRefresh.signal()
+
+        do {
+            _ = try await refresh.value
+            Issue.record("Expected old validation to be invalidated after an owner edit.")
+        } catch let error as GitHubAuthError {
+            #expect(error == .configurationChanged)
+        }
+
+        let storedCredential = try #require(try store.loadCredential())
+        #expect(storedCredential.accessToken == "ghu_rotated")
+        #expect(storedCredential.refreshToken == "ghr_rotated")
+        let summary = try await newConfigurationValidation.value
+        #expect(summary.user == GitHubUser(login: "mona"))
+    }
+
+    @Test
+    func changingExpectedOwnersPropagatesAnUnrotatedRefreshFailure() async throws {
+        let store = KeychainTokenStore(
+            service: "com.github-pr-inbox.tests.\(UUID().uuidString)",
+            account: "expected-owner-refresh-failure"
+        )
+        defer { try? store.deleteCredential() }
+        let credential = GitHubCredential(
+            accessToken: "ghu_expired",
+            refreshToken: "ghr_old",
+            accessTokenExpiresAt: Date().addingTimeInterval(-60),
+            refreshTokenExpiresAt: Date().addingTimeInterval(60 * 60),
+            userID: 7,
+            userLogin: "mona",
+            authorizedOwners: [],
+            accessibleRepositories: [],
+            lastValidatedAt: nil
+        )
+        try store.saveCredential(credential)
+
+        let refreshStarted = DispatchSemaphore(value: 0)
+        let allowRefresh = DispatchSemaphore(value: 0)
+        let session = makeMockSession { request in
+            let url = try #require(request.url)
+            guard (url.host, url.path) == ("github.com", "/login/oauth/access_token") else {
+                throw NSError(domain: "MockURLProtocol", code: 24)
+            }
+            refreshStarted.signal()
+            #expect(allowRefresh.wait(timeout: .now() + 5) == .success)
+            return jsonResponse(statusCode: 503, body: #"{ "message": "temporary failure" }"#)
+        }
+        let provider = testProvider(session: session, store: store)
+        let originalRefresh = Task { try await provider.refreshIfNeeded(expectedScopes: []) }
+        #expect(await waitForSemaphore(refreshStarted, timeout: 2) == .success)
+
+        await provider.updateConfiguration(
+            GitHubAuthConfiguration(
+                clientID: "Iv1.test",
+                appSlug: "github-pr-inbox",
+                expectedOwners: ["other-org"]
+            )
+        )
+        let newConfigurationValidation = Task {
+            try await provider.validateOrgAccess(expectedScopes: [])
+        }
+        allowRefresh.signal()
+
+        func expectNetworkFailure<Value>(_ task: Task<Value, Error>) async {
+            do {
+                _ = try await task.value
+                Issue.record("Expected the original refresh outage to propagate.")
+            } catch let error as GitHubAuthError {
+                if case .network = error {
+                    return
+                }
+                Issue.record("Expected a retryable network error, got \(error).")
+            } catch {
+                Issue.record("Expected a GitHub authentication error, got \(error).")
+            }
+        }
+        await expectNetworkFailure(originalRefresh)
+        await expectNetworkFailure(newConfigurationValidation)
+
+        let storedCredential = try #require(try store.loadCredential())
+        #expect(storedCredential.accessToken == credential.accessToken)
+        #expect(storedCredential.refreshToken == credential.refreshToken)
+    }
+
+    @Test
     func reportsSAMLSSORequirementSeparatelyFromOtherAuthorizationFailures() async throws {
         let store = KeychainTokenStore(
             service: "com.github-pr-inbox.tests.\(UUID().uuidString)",

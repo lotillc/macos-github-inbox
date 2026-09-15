@@ -428,6 +428,7 @@ actor GitHubAuthProvider {
     private var pendingAuthorization: GitHubDeviceAuthorization?
     private var refreshTask: Task<GitHubCredential, Error>?
     private var refreshTaskGeneration: UInt?
+    private var refreshTaskConfiguration: GitHubAuthConfiguration?
     private var refreshTaskNonce: UInt?
     private var nextRefreshTaskNonce: UInt = 0
     private var pendingRefreshTask: Task<PendingGitHubDeviceCredential, Error>?
@@ -465,16 +466,21 @@ actor GitHubAuthProvider {
             return
         }
 
-        configurationGeneration &+= 1
-        refreshTask?.cancel()
-        refreshTask = nil
-        refreshTaskGeneration = nil
-        refreshTaskNonce = nil
-        pendingRefreshTask?.cancel()
-        pendingRefreshTask = nil
-        pendingRefreshTaskGeneration = nil
-        pendingRefreshTaskNonce = nil
+        // A refresh-token grant may rotate its refresh token.  Changing only
+        // the desired owner list must not cancel that in-flight grant: GitHub
+        // may already have consumed the old refresh token.  An app identity
+        // change is different; its token requests must never be persisted.
         if isDifferentAppIdentity(configuration, self.configuration) {
+            configurationGeneration &+= 1
+            refreshTask?.cancel()
+            refreshTask = nil
+            refreshTaskGeneration = nil
+            refreshTaskConfiguration = nil
+            refreshTaskNonce = nil
+            pendingRefreshTask?.cancel()
+            pendingRefreshTask = nil
+            pendingRefreshTaskGeneration = nil
+            pendingRefreshTaskNonce = nil
             pendingAuthorization = nil
             try? tokenStore.deletePendingDeviceCredential()
         }
@@ -486,6 +492,7 @@ actor GitHubAuthProvider {
         refreshTask?.cancel()
         refreshTask = nil
         refreshTaskGeneration = nil
+        refreshTaskConfiguration = nil
         refreshTaskNonce = nil
         pendingRefreshTask?.cancel()
         pendingRefreshTask = nil
@@ -683,7 +690,7 @@ actor GitHubAuthProvider {
         let context = try configuredContext()
         let configuration = context.configuration
         let credential = try await refreshIfNeeded(expectedScopes: expectedScopes)
-        try ensureCurrent(context)
+        try ensureValidationCurrent(context)
         let validation = try await fetchAccessValidation(
             token: credential.accessToken,
             expectedScopes: expectedScopes,
@@ -710,6 +717,7 @@ actor GitHubAuthProvider {
         refreshTask?.cancel()
         refreshTask = nil
         refreshTaskGeneration = nil
+        refreshTaskConfiguration = nil
         refreshTaskNonce = nil
         pendingRefreshTask?.cancel()
         pendingRefreshTask = nil
@@ -726,6 +734,7 @@ actor GitHubAuthProvider {
         refreshTask?.cancel()
         refreshTask = nil
         refreshTaskGeneration = nil
+        refreshTaskConfiguration = nil
         refreshTaskNonce = nil
         pendingRefreshTask?.cancel()
         pendingRefreshTask = nil
@@ -742,7 +751,45 @@ actor GitHubAuthProvider {
         context: AuthenticationContext
     ) async throws -> GitHubCredential {
         if let refreshTask, refreshTaskGeneration == context.generation {
-            return try await refreshTask.value
+            if refreshTaskConfiguration == context.configuration {
+                return try await refreshTask.value
+            }
+
+            // Let the old configuration finish persisting any rotated token
+            // before validating under the new owner policy. Starting a second
+            // OAuth refresh here could reuse a refresh token that GitHub has
+            // already consumed.
+            let taskNonce = refreshTaskNonce
+            let refreshResult: Result<GitHubCredential, Error>
+            do {
+                refreshResult = .success(try await refreshTask.value)
+            } catch {
+                refreshResult = .failure(error)
+            }
+            if refreshTaskGeneration == context.generation, refreshTaskNonce == taskNonce {
+                self.refreshTask = nil
+                refreshTaskGeneration = nil
+                refreshTaskConfiguration = nil
+                refreshTaskNonce = nil
+            }
+            try ensureCurrent(context)
+            guard let currentCredential = try tokenStore.loadCredential() else {
+                throw GitHubAuthError.signedOut
+            }
+            switch refreshResult {
+            case let .success(refreshedCredential):
+                return refreshedCredential
+            case let .failure(error):
+                let accessTokenChanged = currentCredential.accessToken != credential.accessToken
+                let refreshTokenChanged = currentCredential.refreshToken != credential.refreshToken
+                let hasUsableAccessToken = currentCredential.accessTokenExpiresAt.map {
+                    $0 > Date().addingTimeInterval(300)
+                } ?? false
+                guard accessTokenChanged || refreshTokenChanged || hasUsableAccessToken else {
+                    throw error
+                }
+                return currentCredential
+            }
         }
 
         let task = Task { [self] in
@@ -755,6 +802,7 @@ actor GitHubAuthProvider {
         }
         refreshTask = task
         refreshTaskGeneration = context.generation
+        refreshTaskConfiguration = context.configuration
         nextRefreshTaskNonce &+= 1
         let taskNonce = nextRefreshTaskNonce
         refreshTaskNonce = taskNonce
@@ -763,6 +811,7 @@ actor GitHubAuthProvider {
             if refreshTaskGeneration == context.generation, refreshTaskNonce == taskNonce {
                 refreshTask = nil
                 refreshTaskGeneration = nil
+                refreshTaskConfiguration = nil
                 refreshTaskNonce = nil
             }
             return refreshedCredential
@@ -770,6 +819,7 @@ actor GitHubAuthProvider {
             if refreshTaskGeneration == context.generation, refreshTaskNonce == taskNonce {
                 refreshTask = nil
                 refreshTaskGeneration = nil
+                refreshTaskConfiguration = nil
                 refreshTaskNonce = nil
             }
             throw error
@@ -848,13 +898,14 @@ actor GitHubAuthProvider {
         )
 
         do {
+            try ensureValidationCurrent(context)
             let validation = try await fetchAccessValidation(
                 token: accessToken,
                 expectedScopes: expectedScopes,
                 configuration: configuration
             )
             updatedCredential = updatedCredential.updating(validation: validation)
-            try ensureCurrent(context)
+            try ensureValidationCurrent(context)
             try tokenStore.saveCredential(updatedCredential)
             return updatedCredential
         } catch let error as GitHubAuthError {
@@ -893,13 +944,14 @@ actor GitHubAuthProvider {
         )
 
         do {
+            try ensureValidationCurrent(context)
             let validation = try await fetchAccessValidation(
                 token: credential.accessToken,
                 expectedScopes: expectedScopes,
                 configuration: configuration
             )
             credential = credential.updating(validation: validation)
-            try ensureCurrent(context)
+            try ensureValidationCurrent(context)
             try tokenStore.saveCredential(credential)
             try tokenStore.deletePendingDeviceCredential()
             return credential
@@ -1024,7 +1076,7 @@ actor GitHubAuthProvider {
         for credential: GitHubCredential,
         context: AuthenticationContext
     ) throws -> GitHubCredential {
-        try ensureCurrent(context)
+        try ensureValidationCurrent(context)
 
         // Validation can suspend while another request refreshes an expired
         // token. Preserve that rotated token and refresh-token pair, while
@@ -1211,6 +1263,13 @@ actor GitHubAuthProvider {
 
     private func ensureCurrent(_ context: AuthenticationContext) throws {
         guard context.generation == configurationGeneration else {
+            throw GitHubAuthError.configurationChanged
+        }
+    }
+
+    private func ensureValidationCurrent(_ context: AuthenticationContext) throws {
+        try ensureCurrent(context)
+        guard context.configuration == configuration else {
             throw GitHubAuthError.configurationChanged
         }
     }
