@@ -327,22 +327,31 @@ final class InboxViewModel: ObservableObject {
                     continue
                 }
 
+                if isTransientAuthenticationCheckError(error) {
+                    // The device-code exchange can have already stored a
+                    // pending credential before profile or installation
+                    // validation temporarily fails. There is no device code
+                    // left to poll, so resume that durable credential rather
+                    // than showing a reconnect action that would delete it.
+                    await resumeDurablePendingCredential(generation: generation)
+                    return
+                }
+
                 if case GitHubAuthError.pendingAuthorizationRequired = error {
                     // An owner-policy edit starts a replacement poll. Its
                     // predecessor may have already exchanged and promoted the
                     // device token under the new policy, so no pending code is
                     // not synonymous with a signed-out account.
-                    signInTask = nil
-                    await refreshAuthStatus()
+                    await resumeDurablePendingCredential(generation: generation)
                     return
                 }
 
                 if case GitHubAuthError.configurationChanged = error {
-                    // A superseded poll must re-read the durable auth state.
-                    // This preserves a just-promoted session and also resumes
-                    // a pending device credential under the current policy.
-                    signInTask = nil
-                    await refreshAuthStatus()
+                    // An owner-policy edit can supersede this poll after its
+                    // device token was persisted. Resume that durable state
+                    // with the same retry behavior used for a direct
+                    // post-exchange network failure.
+                    await resumeDurablePendingCredential(generation: generation)
                     return
                 }
 
@@ -1088,6 +1097,50 @@ final class InboxViewModel: ObservableObject {
         }
 
         return await authProvider.pendingAuthorizationState()
+    }
+
+    private func resumeDurablePendingCredential(generation: UInt) async {
+        while !Task.isCancelled, isCurrentConnection(generation) {
+            do {
+                let summary = try await authProvider.validateOrgAccess(expectedScopes: settings.scopes)
+                guard isCurrentConnection(generation) else {
+                    return
+                }
+                signInTask = nil
+                settings.reloadCredentialPresence()
+                currentUser = summary.user
+                setAuthenticatedSession(summary, ownerClassificationKnown: true)
+                authStatusMessage = "Signed in as @\(summary.user.login)."
+                await refresh()
+                return
+            } catch is CancellationError {
+                return
+            } catch {
+                guard isCurrentConnection(generation) else {
+                    return
+                }
+                if isTransientAuthenticationCheckError(error) {
+                    authStatusMessage = "GitHub sign-in is temporarily unavailable. Retrying…"
+                    do {
+                        try await Task.sleep(nanoseconds: 1_000_000_000)
+                    } catch {
+                        return
+                    }
+                    continue
+                }
+
+                signInTask = nil
+                if case let GitHubAuthError.archivedRepositories(repositories) = error {
+                    removeArchivedWatchRepositories(repositories)
+                    authStatusMessage = error.localizedDescription
+                    await refreshAuthStatus(forceValidation: true)
+                    await refresh()
+                    return
+                }
+                mapAuthError(error)
+                return
+            }
+        }
     }
 
     private func isCurrentConnection(_ generation: UInt) -> Bool {

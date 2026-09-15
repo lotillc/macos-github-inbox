@@ -551,6 +551,66 @@ struct AppSettingsTests {
     }
 
     @Test
+    func resumesDurableDeviceCredentialAfterPostExchangeNetworkFailure() async throws {
+        let tokenStore = testTokenStore(account: "resume-durable-device-credential")
+        defer {
+            try? tokenStore.deleteCredential()
+            try? tokenStore.deletePendingDeviceCredential()
+        }
+        let settings = makeSettings(
+            account: "resume-durable-device-credential",
+            tokenStore: tokenStore,
+            configuration: GitHubAuthConfiguration(
+                clientID: "Iv1.test",
+                appSlug: "test-app",
+                expectedOwners: []
+            )
+        )
+        let profileRequests = LockedSettingsTestInt(0)
+        let session = makeSettingsMockSession { request in
+            let url = try #require(request.url)
+            switch (url.host, url.path) {
+            case ("github.com", "/login/device/code"):
+                return settingsJSONResponse(
+                    statusCode: 200,
+                    body: #"{ "device_code": "device-code", "user_code": "ABCD-EFGH", "verification_uri": "https://github.com/login/device", "expires_in": 900, "interval": 1 }"#
+                )
+            case ("github.com", "/login/oauth/access_token"):
+                return settingsJSONResponse(
+                    statusCode: 200,
+                    body: #"{ "access_token": "ghu_issued", "refresh_token": "ghr_issued", "expires_in": 28800 }"#
+                )
+            case ("api.github.com", "/user"):
+                profileRequests.store(profileRequests.load() + 1)
+                if profileRequests.load() <= 2 {
+                    return settingsJSONResponse(statusCode: 503, body: #"{ "message": "temporary outage" }"#)
+                }
+                return settingsJSONResponse(statusCode: 200, body: #"{ "id": 7, "login": "mona" }"#)
+            case ("api.github.com", "/user/installations"):
+                return settingsJSONResponse(statusCode: 200, body: #"{ "installations": [] }"#)
+            default:
+                throw NSError(domain: "SettingsMockURLProtocol", code: 41)
+            }
+        }
+        let provider = GitHubAuthProvider(
+            configuration: settings.gitHubAppConfiguration,
+            session: session,
+            tokenStore: tokenStore
+        )
+        let model = InboxViewModel(settings: settings, authProvider: provider)
+
+        await model.beginSignIn()
+
+        guard await waitForAuthenticatedSession(in: model, timeout: 4) else {
+            Issue.record("The durable device credential did not resume after the transient profile failure.")
+            return
+        }
+        #expect(profileRequests.load() == 3)
+        #expect(try tokenStore.loadPendingDeviceCredential() == nil)
+        #expect(model.currentUser == GitHubUser(login: "mona"))
+    }
+
+    @Test
     func preservesCachedSessionWhenInstallationValidationIsTemporarilyUnavailable() async throws {
         let tokenStore = testTokenStore(account: "cached-session-validation-outage")
         defer { try? tokenStore.deleteCredential() }
@@ -886,6 +946,22 @@ private func waitForMissingConfiguration(
     let deadline = Date().addingTimeInterval(timeout)
     while Date() < deadline {
         if case .missingConfiguration = model.authState {
+            return true
+        }
+        try? await Task.sleep(nanoseconds: 10_000_000)
+    }
+
+    return false
+}
+
+@MainActor
+private func waitForAuthenticatedSession(
+    in model: InboxViewModel,
+    timeout: TimeInterval
+) async -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        if model.authState.isAuthenticated {
             return true
         }
         try? await Task.sleep(nanoseconds: 10_000_000)
