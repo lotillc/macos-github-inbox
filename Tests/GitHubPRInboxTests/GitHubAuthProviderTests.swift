@@ -16,6 +16,7 @@ struct GitHubAuthProviderTests {
         }
 
         let credential = GitHubCredential(
+            appClientID: "Iv1.test",
             accessToken: "ghu_test",
             refreshToken: "ghr_test",
             accessTokenExpiresAt: Date(timeIntervalSince1970: 1_700_000_000),
@@ -185,6 +186,7 @@ struct GitHubAuthProviderTests {
 
         try store.saveCredential(
             GitHubCredential(
+                appClientID: "Iv1.test",
                 accessToken: "ghu_expired",
                 refreshToken: "ghr_previous",
                 accessTokenExpiresAt: Date().addingTimeInterval(-60),
@@ -257,6 +259,7 @@ struct GitHubAuthProviderTests {
         defer { try? store.deleteCredential() }
         try store.saveCredential(
             GitHubCredential(
+                appClientID: "Iv1.test",
                 accessToken: "ghu_expired",
                 refreshToken: "ghr_previous",
                 accessTokenExpiresAt: Date().addingTimeInterval(-60),
@@ -314,6 +317,7 @@ struct GitHubAuthProviderTests {
         }
         try store.savePendingDeviceCredential(
             PendingGitHubDeviceCredential(
+                appClientID: "Iv1.test",
                 accessToken: "ghu_issued",
                 refreshToken: "ghr_issued",
                 accessTokenExpiresAt: Date().addingTimeInterval(60 * 60),
@@ -353,6 +357,7 @@ struct GitHubAuthProviderTests {
         }
         try store.savePendingDeviceCredential(
             PendingGitHubDeviceCredential(
+                appClientID: "Iv1.test",
                 accessToken: "ghu_expired",
                 refreshToken: "ghr_issued",
                 accessTokenExpiresAt: Date().addingTimeInterval(-60),
@@ -447,6 +452,65 @@ struct GitHubAuthProviderTests {
     }
 
     @Test
+    func tokenRotationDoesNotOverwriteValidationCompletedWhileItWasInFlight() async throws {
+        let store = KeychainTokenStore(
+            service: "com.github-pr-inbox.tests.\(UUID().uuidString)",
+            account: "refresh-validation-race"
+        )
+        defer { try? store.deleteCredential() }
+        try store.saveCredential(testCredential())
+
+        let refreshStarted = DispatchSemaphore(value: 0)
+        let allowRefresh = DispatchSemaphore(value: 0)
+        let session = makeDelayedMockSession { request, protocolInstance in
+            guard let url = request.url else {
+                protocolInstance.fail(with: NSError(domain: "MockURLProtocol", code: 27))
+                return
+            }
+            switch (url.host, url.path) {
+            case ("github.com", "/login/oauth/access_token"):
+                refreshStarted.signal()
+                let delayedProtocol = DelayedProtocolReference(protocolInstance)
+                DispatchQueue.global().async {
+                    guard allowRefresh.wait(timeout: .now() + 5) == .success else {
+                        delayedProtocol.value.fail(with: NSError(domain: "MockURLProtocol", code: 28))
+                        return
+                    }
+                    delayedProtocol.value.respond(with: jsonResponse(
+                        statusCode: 200,
+                        body: #"{ "access_token": "ghu_rotated", "refresh_token": "ghr_rotated", "expires_in": 28800 }"#
+                    ))
+                }
+            case ("api.github.com", "/user"):
+                protocolInstance.respond(with: jsonResponse(statusCode: 200, body: #"{ "id": 7, "login": "mona" }"#))
+            case ("api.github.com", "/user/installations"):
+                protocolInstance.respond(with: jsonResponse(
+                    statusCode: 200,
+                    body: #"{ "installations": [{ "id": 1, "account": { "login": "acme", "type": "Organization" }, "repository_selection": "all" }] }"#
+                ))
+            case ("api.github.com", "/user/installations/1/repositories"):
+                protocolInstance.respond(with: jsonResponse(statusCode: 200, body: #"{ "repositories": [{ "full_name": "acme/backend" }] }"#))
+            default:
+                protocolInstance.fail(with: NSError(domain: "MockURLProtocol", code: 27))
+            }
+        }
+        let provider = testProvider(session: session, store: store)
+        let refresh = Task { try await provider.forceRefresh(expectedScopes: []) }
+        #expect(await waitForSemaphore(refreshStarted, timeout: 2) == .success)
+
+        let summary = try await provider.validateOrgAccess(expectedScopes: [])
+        #expect(summary.authorizedOwners == ["acme"])
+        allowRefresh.signal()
+        _ = try await refresh.value
+
+        let storedCredential = try #require(try store.loadCredential())
+        #expect(storedCredential.accessToken == "ghu_rotated")
+        #expect(storedCredential.refreshToken == "ghr_rotated")
+        #expect(storedCredential.authorizedOwners == ["acme"])
+        #expect(storedCredential.accessibleRepositories == ["acme/backend"])
+    }
+
+    @Test
     func coalescesConcurrentPendingCredentialRefreshes() async throws {
         let store = KeychainTokenStore(
             service: "com.github-pr-inbox.tests.\(UUID().uuidString)",
@@ -458,6 +522,7 @@ struct GitHubAuthProviderTests {
         }
         try store.savePendingDeviceCredential(
             PendingGitHubDeviceCredential(
+                appClientID: "Iv1.test",
                 accessToken: "ghu_expired",
                 refreshToken: "ghr_previous",
                 accessTokenExpiresAt: Date().addingTimeInterval(-60),
@@ -517,6 +582,7 @@ struct GitHubAuthProviderTests {
         defer { try? store.deleteCredential() }
         var credential = testCredential()
         credential = GitHubCredential(
+            appClientID: "Iv1.test",
             accessToken: credential.accessToken,
             refreshToken: credential.refreshToken,
             accessTokenExpiresAt: Date().addingTimeInterval(-60),
@@ -636,7 +702,7 @@ struct GitHubAuthProviderTests {
             account: "configuration-change-race"
         )
         defer { try? store.deleteCredential() }
-        try store.saveCredential(testCredential())
+        try store.saveCredential(testCredential(appClientID: "Iv1.old"))
 
         let requestStarted = DispatchSemaphore(value: 0)
         let allowResponse = DispatchSemaphore(value: 0)
@@ -771,6 +837,7 @@ struct GitHubAuthProviderTests {
         )
         defer { try? store.deleteCredential() }
         let credential = GitHubCredential(
+            appClientID: "Iv1.test",
             accessToken: "ghu_expired",
             refreshToken: "ghr_old",
             accessTokenExpiresAt: Date().addingTimeInterval(-60),
@@ -839,6 +906,340 @@ struct GitHubAuthProviderTests {
     }
 
     @Test
+    func cancelingReplacementAuthorizationPreservesAnInFlightRotatedRefreshToken() async throws {
+        let store = KeychainTokenStore(
+            service: "com.github-pr-inbox.tests.\(UUID().uuidString)",
+            account: "cancel-replacement-refresh-race"
+        )
+        defer { try? store.deleteCredential() }
+        try store.saveCredential(
+            GitHubCredential(
+                appClientID: "Iv1.test",
+                accessToken: "ghu_expired",
+                refreshToken: "ghr_old",
+                accessTokenExpiresAt: Date().addingTimeInterval(-60),
+                refreshTokenExpiresAt: Date().addingTimeInterval(60 * 60),
+                userID: 7,
+                userLogin: "mona",
+                authorizedOwners: [],
+                accessibleRepositories: [],
+                lastValidatedAt: nil
+            )
+        )
+
+        let refreshStarted = DispatchSemaphore(value: 0)
+        let allowRefresh = DispatchSemaphore(value: 0)
+        let session = makeMockSession { request in
+            let url = try #require(request.url)
+            switch (url.host, url.path) {
+            case ("github.com", "/login/oauth/access_token"):
+                refreshStarted.signal()
+                #expect(allowRefresh.wait(timeout: .now() + 5) == .success)
+                return jsonResponse(
+                    statusCode: 200,
+                    body: #"{ "access_token": "ghu_rotated", "refresh_token": "ghr_rotated", "expires_in": 28800 }"#
+                )
+            case ("api.github.com", "/user"):
+                return jsonResponse(statusCode: 200, body: #"{ "id": 7, "login": "mona" }"#)
+            case ("api.github.com", "/user/installations"):
+                return jsonResponse(statusCode: 200, body: #"{ "installations": [] }"#)
+            default:
+                throw NSError(domain: "MockURLProtocol", code: 24)
+            }
+        }
+        let provider = testProvider(session: session, store: store)
+        let refresh = Task { try await provider.refreshIfNeeded(expectedScopes: []) }
+        #expect(await waitForSemaphore(refreshStarted, timeout: 2) == .success)
+
+        await provider.cancelPendingAuthorization()
+        allowRefresh.signal()
+
+        let refreshedCredential = try await refresh.value
+        #expect(refreshedCredential.accessToken == "ghu_rotated")
+        let storedCredential = try #require(try store.loadCredential())
+        #expect(storedCredential.accessToken == "ghu_rotated")
+        #expect(storedCredential.refreshToken == "ghr_rotated")
+    }
+
+    @Test
+    func cancelingDeviceFlowRejectsItsLateTokenResponse() async throws {
+        let store = KeychainTokenStore(
+            service: "com.github-pr-inbox.tests.\(UUID().uuidString)",
+            account: "canceled-device-flow-response"
+        )
+        defer {
+            try? store.deleteCredential()
+            try? store.deletePendingDeviceCredential()
+        }
+        let activeCredential = testCredential()
+        try store.saveCredential(activeCredential)
+
+        let pollStarted = DispatchSemaphore(value: 0)
+        let allowPollResponse = DispatchSemaphore(value: 0)
+        let session = makeDelayedMockSession { request, protocolInstance in
+            guard let url = request.url else {
+                protocolInstance.fail(with: NSError(domain: "MockURLProtocol", code: 29))
+                return
+            }
+            switch (url.host, url.path) {
+            case ("github.com", "/login/device/code"):
+                protocolInstance.respond(with: jsonResponse(
+                    statusCode: 200,
+                    body: #"{ "device_code": "device", "user_code": "ABCD-EFGH", "verification_uri": "https://github.com/login/device", "expires_in": 900, "interval": 5 }"#
+                ))
+            case ("github.com", "/login/oauth/access_token"):
+                pollStarted.signal()
+                let delayedProtocol = DelayedProtocolReference(protocolInstance)
+                DispatchQueue.global().async {
+                    guard allowPollResponse.wait(timeout: .now() + 5) == .success else {
+                        delayedProtocol.value.fail(with: NSError(domain: "MockURLProtocol", code: 30))
+                        return
+                    }
+                    delayedProtocol.value.respond(with: jsonResponse(
+                        statusCode: 200,
+                        body: #"{ "access_token": "ghu_late", "refresh_token": "ghr_late", "expires_in": 28800 }"#
+                    ))
+                }
+            default:
+                protocolInstance.fail(with: NSError(domain: "MockURLProtocol", code: 31))
+            }
+        }
+        let provider = testProvider(session: session, store: store)
+        _ = try await provider.startSignIn(expectedScopes: [])
+        let poll = Task { try await provider.pollSignIn(expectedScopes: []) }
+        #expect(await waitForSemaphore(pollStarted, timeout: 2) == .success)
+
+        await provider.cancelPendingAuthorization()
+        allowPollResponse.signal()
+
+        do {
+            _ = try await poll.value
+            Issue.record("Expected a canceled device flow's late token response to be rejected.")
+        } catch let error as GitHubAuthError {
+            #expect(error == .configurationChanged)
+        }
+        #expect(try store.loadPendingDeviceCredential() == nil)
+        let storedCredential = try #require(try store.loadCredential())
+        #expect(storedCredential.accessToken == activeCredential.accessToken)
+        #expect(storedCredential.refreshToken == activeCredential.refreshToken)
+    }
+
+    @Test
+    func deviceTokenResponseUsesPolicyEditedDuringPolling() async throws {
+        let store = KeychainTokenStore(
+            service: "com.github-pr-inbox.tests.\(UUID().uuidString)",
+            account: "device-flow-policy-edit"
+        )
+        defer {
+            try? store.deleteCredential()
+            try? store.deletePendingDeviceCredential()
+        }
+
+        let pollStarted = DispatchSemaphore(value: 0)
+        let allowPollResponse = DispatchSemaphore(value: 0)
+        let session = makeDelayedMockSession { request, protocolInstance in
+            guard let url = request.url else {
+                protocolInstance.fail(with: NSError(domain: "MockURLProtocol", code: 35))
+                return
+            }
+            switch (url.host, url.path) {
+            case ("github.com", "/login/device/code"):
+                protocolInstance.respond(with: jsonResponse(
+                    statusCode: 200,
+                    body: #"{ "device_code": "device", "user_code": "ABCD-EFGH", "verification_uri": "https://github.com/login/device", "expires_in": 900, "interval": 5 }"#
+                ))
+            case ("github.com", "/login/oauth/access_token"):
+                pollStarted.signal()
+                let delayedProtocol = DelayedProtocolReference(protocolInstance)
+                DispatchQueue.global().async {
+                    guard allowPollResponse.wait(timeout: .now() + 5) == .success else {
+                        delayedProtocol.value.fail(with: NSError(domain: "MockURLProtocol", code: 36))
+                        return
+                    }
+                    delayedProtocol.value.respond(with: jsonResponse(
+                        statusCode: 200,
+                        body: #"{ "access_token": "ghu_issued", "refresh_token": "ghr_issued", "expires_in": 28800 }"#
+                    ))
+                }
+            case ("api.github.com", "/user"):
+                protocolInstance.respond(with: jsonResponse(statusCode: 200, body: #"{ "id": 7, "login": "mona" }"#))
+            case ("api.github.com", "/user/installations"):
+                protocolInstance.respond(with: jsonResponse(
+                    statusCode: 200,
+                    body: #"{ "installations": [{ "id": 1, "account": { "login": "other", "type": "Organization" }, "repository_selection": "all" }] }"#
+                ))
+            case ("api.github.com", "/user/installations/1/repositories"):
+                protocolInstance.respond(with: jsonResponse(statusCode: 200, body: #"{ "repositories": [] }"#))
+            default:
+                protocolInstance.fail(with: NSError(domain: "MockURLProtocol", code: 37))
+            }
+        }
+        let provider = GitHubAuthProvider(
+            configuration: GitHubAuthConfiguration(
+                clientID: "Iv1.test",
+                appSlug: "github-pr-inbox",
+                expectedOwners: ["acme"]
+            ),
+            session: session,
+            tokenStore: store
+        )
+        _ = try await provider.startSignIn(expectedScopes: [])
+        let poll = Task { try await provider.pollSignIn(expectedScopes: []) }
+        #expect(await waitForSemaphore(pollStarted, timeout: 2) == .success)
+
+        await provider.updateConfiguration(
+            GitHubAuthConfiguration(
+                clientID: "Iv1.test",
+                appSlug: "github-pr-inbox",
+                expectedOwners: ["other"]
+            )
+        )
+        allowPollResponse.signal()
+
+        let result = try await poll.value
+        guard case let .completed(credential) = result else {
+            Issue.record("Expected the completed device token to resolve under the new owner policy.")
+            return
+        }
+        #expect(credential.authorizedOwners == ["other"])
+        #expect(try store.loadPendingDeviceCredential() == nil)
+    }
+
+    @Test
+    func policyEditRestartsPendingResolutionInsteadOfJoiningOldTask() async throws {
+        let store = KeychainTokenStore(
+            service: "com.github-pr-inbox.tests.\(UUID().uuidString)",
+            account: "pending-resolution-policy-edit"
+        )
+        defer {
+            try? store.deleteCredential()
+            try? store.deletePendingDeviceCredential()
+        }
+        try store.savePendingDeviceCredential(
+            PendingGitHubDeviceCredential(
+                appClientID: "Iv1.test",
+                accessToken: "ghu_pending",
+                refreshToken: "ghr_pending",
+                accessTokenExpiresAt: Date().addingTimeInterval(60 * 60),
+                refreshTokenExpiresAt: Date().addingTimeInterval(60 * 60 * 24)
+            )
+        )
+
+        let firstValidationStarted = DispatchSemaphore(value: 0)
+        let allowFirstValidation = DispatchSemaphore(value: 0)
+        let installationRequests = LockedRequestCounter()
+        let session = makeDelayedMockSession { request, protocolInstance in
+            guard let url = request.url else {
+                protocolInstance.fail(with: NSError(domain: "MockURLProtocol", code: 32))
+                return
+            }
+            switch (url.host, url.path) {
+            case ("api.github.com", "/user"):
+                protocolInstance.respond(with: jsonResponse(statusCode: 200, body: #"{ "id": 7, "login": "mona" }"#))
+            case ("api.github.com", "/user/installations"):
+                installationRequests.increment()
+                if installationRequests.value == 1 {
+                    firstValidationStarted.signal()
+                    let delayedProtocol = DelayedProtocolReference(protocolInstance)
+                    DispatchQueue.global().async {
+                        guard allowFirstValidation.wait(timeout: .now() + 5) == .success else {
+                            delayedProtocol.value.fail(with: NSError(domain: "MockURLProtocol", code: 33))
+                            return
+                        }
+                        delayedProtocol.value.respond(with: jsonResponse(
+                            statusCode: 200,
+                            body: #"{ "installations": [{ "id": 1, "account": { "login": "other", "type": "Organization" }, "repository_selection": "all" }] }"#
+                        ))
+                    }
+                } else {
+                    protocolInstance.respond(with: jsonResponse(
+                        statusCode: 200,
+                        body: #"{ "installations": [{ "id": 1, "account": { "login": "other", "type": "Organization" }, "repository_selection": "all" }] }"#
+                    ))
+                }
+            case ("api.github.com", "/user/installations/1/repositories"):
+                protocolInstance.respond(with: jsonResponse(statusCode: 200, body: #"{ "repositories": [] }"#))
+            default:
+                protocolInstance.fail(with: NSError(domain: "MockURLProtocol", code: 34))
+            }
+        }
+        let provider = GitHubAuthProvider(
+            configuration: GitHubAuthConfiguration(
+                clientID: "Iv1.test",
+                appSlug: "github-pr-inbox",
+                expectedOwners: ["acme"]
+            ),
+            session: session,
+            tokenStore: store
+        )
+        let oldResolution = Task { try await provider.refreshIfNeeded(expectedScopes: []) }
+        #expect(await waitForSemaphore(firstValidationStarted, timeout: 2) == .success)
+
+        await provider.updateConfiguration(
+            GitHubAuthConfiguration(
+                clientID: "Iv1.test",
+                appSlug: "github-pr-inbox",
+                expectedOwners: ["other"]
+            )
+        )
+        let newResolution = Task { try await provider.refreshIfNeeded(expectedScopes: []) }
+        allowFirstValidation.signal()
+
+        do {
+            _ = try await oldResolution.value
+            Issue.record("Expected the old policy's pending resolution to be invalidated.")
+        } catch {
+            // Its stale policy may fail validation before it observes the
+            // policy revision; either way, it must not satisfy the new caller.
+        }
+        let credential = try await newResolution.value
+        #expect(credential.authorizedOwners == ["other"])
+        #expect(installationRequests.value == 2)
+    }
+
+    @Test
+    func rejectsCredentialsIssuedByAnotherGitHubApp() async throws {
+        let store = KeychainTokenStore(
+            service: "com.github-pr-inbox.tests.\(UUID().uuidString)",
+            account: "wrong-app-credential"
+        )
+        defer { try? store.deleteCredential() }
+        try store.saveCredential(testCredential(appClientID: "Iv1.other"))
+
+        let provider = testProvider(session: makeMockSession { _ in
+            throw NSError(domain: "MockURLProtocol", code: 25)
+        }, store: store)
+
+        do {
+            _ = try await provider.currentCredential()
+            Issue.record("Expected a credential issued by another GitHub App to be rejected.")
+        } catch let error as GitHubAuthError {
+            #expect(error == .configurationChanged)
+        }
+    }
+
+    @Test
+    func rejectsLegacyCredentialWithoutGitHubAppProvenance() async throws {
+        let store = KeychainTokenStore(
+            service: "com.github-pr-inbox.tests.\(UUID().uuidString)",
+            account: "legacy-unbound-credential"
+        )
+        defer { try? store.deleteCredential() }
+        try store.saveCredential(testCredential(appClientID: nil))
+
+        let provider = testProvider(session: makeMockSession { _ in
+            throw NSError(domain: "MockURLProtocol", code: 26)
+        }, store: store)
+
+        do {
+            _ = try await provider.currentCredential()
+            Issue.record("Expected a legacy credential without GitHub App provenance to be rejected.")
+        } catch let error as GitHubAuthError {
+            #expect(error == .configurationChanged)
+        }
+    }
+
+    @Test
     func changingExpectedOwnersPropagatesAnUnrotatedRefreshFailure() async throws {
         let store = KeychainTokenStore(
             service: "com.github-pr-inbox.tests.\(UUID().uuidString)",
@@ -846,6 +1247,7 @@ struct GitHubAuthProviderTests {
         )
         defer { try? store.deleteCredential() }
         let credential = GitHubCredential(
+            appClientID: "Iv1.test",
             accessToken: "ghu_expired",
             refreshToken: "ghr_old",
             accessTokenExpiresAt: Date().addingTimeInterval(-60),
@@ -1128,8 +1530,9 @@ struct GitHubAuthProviderTests {
     }
 }
 
-private func testCredential() -> GitHubCredential {
+private func testCredential(appClientID: String? = "Iv1.test") -> GitHubCredential {
     GitHubCredential(
+        appClientID: appClientID,
         accessToken: "ghu_current",
         refreshToken: "ghr_current",
         accessTokenExpiresAt: Date().addingTimeInterval(60 * 60),

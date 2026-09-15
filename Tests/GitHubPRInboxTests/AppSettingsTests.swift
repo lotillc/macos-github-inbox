@@ -115,6 +115,7 @@ struct AppSettingsTests {
         defer { try? tokenStore.deleteCredential() }
         try tokenStore.saveCredential(
             GitHubCredential(
+                appClientID: "Iv1.old",
                 accessToken: "ghu_test",
                 refreshToken: "ghr_test",
                 accessTokenExpiresAt: nil,
@@ -181,7 +182,7 @@ struct AppSettingsTests {
         #expect(model.authState == .signedOut)
         #expect(model.appInstallURL?.absoluteString == "https://github.com/apps/new-app/installations/new")
 
-        try tokenStore.saveCredential(testCredential())
+        try tokenStore.saveCredential(testCredential(appClientID: "Iv1.new"))
         try await model.saveGitHubAppConfiguration(
             clientID: "Iv1.new",
             appSlug: "new-app",
@@ -268,6 +269,7 @@ struct AppSettingsTests {
         )
         try tokenStore.saveCredential(
             GitHubCredential(
+                appClientID: "Iv1.old",
                 accessToken: "ghu_test",
                 refreshToken: "ghr_test",
                 accessTokenExpiresAt: nil,
@@ -400,6 +402,7 @@ struct AppSettingsTests {
         )
         try tokenStore.saveCredential(
             GitHubCredential(
+                appClientID: "Iv1.test",
                 accessToken: "ghu_test",
                 refreshToken: "ghr_test",
                 accessTokenExpiresAt: Date().addingTimeInterval(60 * 60),
@@ -471,6 +474,7 @@ struct AppSettingsTests {
         )
         try tokenStore.saveCredential(
             GitHubCredential(
+                appClientID: "Iv1.test",
                 accessToken: "ghu_test",
                 refreshToken: "ghr_test",
                 accessTokenExpiresAt: Date().addingTimeInterval(60 * 60),
@@ -523,6 +527,7 @@ struct AppSettingsTests {
         )
         try tokenStore.saveCredential(
             GitHubCredential(
+                appClientID: "Iv1.test",
                 accessToken: "ghu_test",
                 refreshToken: "ghr_test",
                 accessTokenExpiresAt: Date().addingTimeInterval(60 * 60),
@@ -745,8 +750,9 @@ struct AppSettingsTests {
         )
     }
 
-    private func testCredential() -> GitHubCredential {
+    private func testCredential(appClientID: String? = "Iv1.test") -> GitHubCredential {
         GitHubCredential(
+            appClientID: appClientID,
             accessToken: "ghu_test",
             refreshToken: "ghr_test",
             accessTokenExpiresAt: Date().addingTimeInterval(60 * 60),

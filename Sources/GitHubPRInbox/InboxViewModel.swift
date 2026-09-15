@@ -327,6 +327,25 @@ final class InboxViewModel: ObservableObject {
                     continue
                 }
 
+                if case GitHubAuthError.pendingAuthorizationRequired = error {
+                    // An owner-policy edit starts a replacement poll. Its
+                    // predecessor may have already exchanged and promoted the
+                    // device token under the new policy, so no pending code is
+                    // not synonymous with a signed-out account.
+                    signInTask = nil
+                    await refreshAuthStatus()
+                    return
+                }
+
+                if case GitHubAuthError.configurationChanged = error {
+                    // A superseded poll must re-read the durable auth state.
+                    // This preserves a just-promoted session and also resumes
+                    // a pending device credential under the current policy.
+                    signInTask = nil
+                    await refreshAuthStatus()
+                    return
+                }
+
                 if case let GitHubAuthError.archivedRepositories(repositories) = error {
                     signInTask = nil
                     removeArchivedWatchRepositories(repositories)
@@ -508,7 +527,7 @@ final class InboxViewModel: ObservableObject {
         // GitHub lets users revoke a prior GitHub App authorization here. A fresh
         // authorization after establishing SAML SSO is required when the original
         // authorization was created without an active organization SSO session.
-        guard let url = URL(string: "https://github.com/settings/apps/authorizations") else {
+        guard let url = URL(string: "https://github.com/settings/connections/applications") else {
             return
         }
 
