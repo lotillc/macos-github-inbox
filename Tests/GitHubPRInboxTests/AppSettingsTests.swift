@@ -425,6 +425,48 @@ struct AppSettingsTests {
     }
 
     @Test
+    func preservesCachedSessionWhenInstallationValidationIsTemporarilyUnavailable() async throws {
+        let tokenStore = testTokenStore(account: "cached-session-validation-outage")
+        defer { try? tokenStore.deleteCredential() }
+        let settings = makeSettings(
+            account: "cached-session-validation-outage",
+            tokenStore: tokenStore,
+            configuration: GitHubAuthConfiguration(clientID: "", appSlug: "", expectedOwners: [])
+        )
+        let session = makeSettingsMockSession { request in
+            let url = try #require(request.url)
+            guard (url.host, url.path) == ("api.github.com", "/user/installations") else {
+                throw NSError(domain: "SettingsMockURLProtocol", code: 14)
+            }
+            return settingsJSONResponse(statusCode: 503, body: #"{ "message": "temporary outage" }"#)
+        }
+        let provider = GitHubAuthProvider(
+            configuration: settings.gitHubAppConfiguration,
+            session: session,
+            tokenStore: tokenStore
+        )
+        let model = InboxViewModel(settings: settings, authProvider: provider)
+        guard await waitForMissingConfiguration(in: model, timeout: 2) else {
+            Issue.record("The initial refresh did not finish with the intentionally missing configuration.")
+            return
+        }
+
+        _ = try settings.saveGitHubAppConfiguration(
+            clientID: "Iv1.test",
+            appSlug: "test-app",
+            expectedOwner: ""
+        )
+        try tokenStore.saveCredential(testCredential())
+        settings.allowlistText = "org:acme"
+
+        await model.refreshAuthStatus()
+
+        #expect(model.authState.isAuthenticated)
+        #expect(model.currentUser == GitHubUser(login: "mona"))
+        #expect(model.authStatusMessage?.contains("503") == true)
+    }
+
+    @Test
     func archivedRepositoryRemovalPublishesOnlyTheCurrentCleanup() async throws {
         let tokenStore = testTokenStore(account: "sequential-archived-watch-scope")
         defer { try? tokenStore.deleteCredential() }

@@ -43,6 +43,8 @@ final class InboxViewModel: ObservableObject {
     private var signInTask: Task<Void, Never>?
     private var connectionGeneration: UInt = 0
 
+    private static let maximumWorkflowRepositoryRequests = 100
+
     private let authoredQualifier = "is:open is:pr archived:false author:@me"
     private let reviewQualifier = "is:open is:pr archived:false review-requested:@me"
 
@@ -189,7 +191,9 @@ final class InboxViewModel: ObservableObject {
                 return
             }
 
-            if reviewRequests.isEmpty && authoredPullRequests.isEmpty && workflowFailures.isEmpty {
+            if workflowMonitoringIsCapped {
+                statusMessage = "Workflow monitoring is limited to the first \(Self.maximumWorkflowRepositoryRequests) accessible repositories. Select specific repositories in Settings to monitor a different set."
+            } else if reviewRequests.isEmpty && authoredPullRequests.isEmpty && workflowFailures.isEmpty {
                 statusMessage = "No open PRs matched your current filters."
             } else {
                 statusMessage = nil
@@ -198,8 +202,8 @@ final class InboxViewModel: ObservableObject {
             guard isCurrentConnection(generation) else {
                 return
             }
-            if case .rateLimited = error as? GitHubClientError {
-                mapRefreshError(error)
+            if shouldPreserveCachedInbox(for: error) {
+                preserveCachedInbox(for: error)
                 statusMessage = error.localizedDescription
                 return
             }
@@ -239,6 +243,7 @@ final class InboxViewModel: ObservableObject {
                 await refreshAuthStatus()
                 return
             }
+
             mapAuthError(error)
         }
     }
@@ -416,6 +421,15 @@ final class InboxViewModel: ObservableObject {
                 removeArchivedWatchRepositories(repositories)
                 authStatusMessage = error.localizedDescription
                 await refreshAuthStatus()
+                return
+            }
+            if let summary = lastKnownSessionSummary,
+               isTransientAuthenticationCheckError(error),
+               configuration == settings.gitHubAppConfiguration
+            {
+                currentUser = summary.user
+                setAuthenticatedSession(summary)
+                authStatusMessage = error.localizedDescription
                 return
             }
             mapAuthError(error)
@@ -861,6 +875,15 @@ final class InboxViewModel: ObservableObject {
     }
 
     private var workflowRepositoryNames: [String] {
+        Array(workflowRepositoryInventory.prefix(Self.maximumWorkflowRepositoryRequests))
+    }
+
+    private var workflowMonitoringIsCapped: Bool {
+        !settings.trackedWorkflowNames.isEmpty
+            && workflowRepositoryInventory.count > Self.maximumWorkflowRepositoryRequests
+    }
+
+    private var workflowRepositoryInventory: [String] {
         let explicitRepositories = settings.explicitRepositoryScopes
         let ownerScopes = Set(settings.scopes.compactMap { scope -> String? in
             switch scope {
@@ -871,8 +894,9 @@ final class InboxViewModel: ObservableObject {
             }
         })
 
+        let canonicalExplicitRepositories = canonicalRepositoryNames(explicitRepositories)
         guard !ownerScopes.isEmpty else {
-            return explicitRepositories
+            return canonicalExplicitRepositories
         }
 
         let ownerRepositories = (repositoryInventorySummary?.accessibleRepositories ?? []).filter { repository in
@@ -881,7 +905,55 @@ final class InboxViewModel: ObservableObject {
             }
             return ownerScopes.contains(owner.lowercased())
         }
-        return Array(Set(explicitRepositories + ownerRepositories)).sorted()
+        let explicitIdentifiers = Set(canonicalExplicitRepositories.map { $0.lowercased() })
+        return canonicalExplicitRepositories + canonicalRepositoryNames(ownerRepositories)
+            .filter { !explicitIdentifiers.contains($0.lowercased()) }
+    }
+
+    private func canonicalRepositoryNames(_ repositories: [String]) -> [String] {
+        var namesByIdentifier = [String: String]()
+        for repository in repositories where !repository.isEmpty {
+            namesByIdentifier[repository.lowercased()] = repository
+        }
+        return namesByIdentifier.values.sorted {
+            $0.localizedCaseInsensitiveCompare($1) == .orderedAscending
+        }
+    }
+
+    private func shouldPreserveCachedInbox(for error: Error) -> Bool {
+        guard lastKnownSessionSummary != nil else {
+            return false
+        }
+
+        switch error {
+        case .rateLimited as GitHubClientError,
+             .network as GitHubClientError,
+             .rateLimited as GitHubAuthError,
+             .network as GitHubAuthError:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func preserveCachedInbox(for error: Error) {
+        switch error {
+        case .rateLimited as GitHubClientError,
+             .rateLimited as GitHubAuthError:
+            mapRefreshError(error)
+        case .network as GitHubClientError,
+             .network as GitHubAuthError:
+            authStatusMessage = error.localizedDescription
+        default:
+            break
+        }
+    }
+
+    private func isTransientAuthenticationCheckError(_ error: Error) -> Bool {
+        if case .network = error as? GitHubAuthError {
+            return true
+        }
+        return false
     }
 
     private func setAuthenticatedSession(_ summary: GitHubSessionSummary) {
