@@ -37,10 +37,10 @@ It is built for people who live in GitHub all day and want a compact triage surf
   - Device flow enabled
   - Client ID
   - App slug
-- App configuration values set through Xcode build settings or environment:
-  - `GITHUB_APP_CLIENT_ID`
-  - `GITHUB_APP_SLUG`
-- Optional: `GITHUB_APP_EXPECTED_OWNERS` as a comma-separated list
+- GitHub App configuration entered from the app's Settings screen:
+  - Client ID
+  - App slug
+  - Optional expected organizations
 
 ## How to use this in your organization
 
@@ -82,18 +82,15 @@ repository (or its organization) to the app's watch list.
 
 ### 3. Configure and distribute the macOS app
 
-Build the app with these public configuration values. Set them in Xcode build settings or in the
-environment that launches Xcode; do not put any secret in the project or release artifact.
+After installing the app, open **Settings** and enter the Client ID, app slug, and optional
+expected organization logins from step 1 (comma-separated when needed). These are public
+identifiers saved for the current macOS user, so changing GitHub Apps does not require rebuilding
+or redistributing the application. Expected organizations are recommended because they help
+identify a missing installation before a user tries to load their inbox.
 
-```bash
-export GITHUB_APP_CLIENT_ID=Iv1.your_client_id
-export GITHUB_APP_SLUG=your-github-app-slug
-export GITHUB_APP_EXPECTED_OWNERS=your-org-login
-open GitHubPRInbox.xcodeproj
-```
-
-`GITHUB_APP_EXPECTED_OWNERS` is optional, but recommended for a single-organization deployment.
-It helps the app identify a missing installation before a user tries to load their inbox.
+Managed/internal builds may still provide `GITHUB_APP_CLIENT_ID`, `GITHUB_APP_SLUG`, and optional
+`GITHUB_APP_EXPECTED_OWNERS` through build settings or the launch environment. The app uses those
+values only to prefill Settings on first launch; saved Settings values always take precedence.
 
 ### 4. Employee sign-in and SAML SSO
 
@@ -123,7 +120,9 @@ open GitHubPRInbox.xcodeproj
 
 Then run the `GitHubPRInbox` scheme on `My Mac`.
 
-Before running locally, set the GitHub App values in the target build settings or export them in the shell that launches Xcode:
+On first launch, configure the Client ID and app slug from **Settings**. For managed development
+builds, you may instead set optional first-launch defaults in the target build settings or the shell
+that launches Xcode:
 
 ```bash
 export GITHUB_APP_CLIENT_ID=Iv1.your_client_id
@@ -131,6 +130,8 @@ export GITHUB_APP_SLUG=your-app-slug
 export GITHUB_APP_EXPECTED_OWNERS=acme
 open GitHubPRInbox.xcodeproj
 ```
+
+Saved Settings values take precedence, so neither path requires a rebuild to switch GitHub Apps.
 
 ### From release
 

@@ -1,4 +1,5 @@
 import Foundation
+import Dispatch
 import Testing
 @testable import GitHubPRInbox
 
@@ -248,6 +249,190 @@ struct GitHubAuthProviderTests {
     }
 
     @Test
+    func usesUpdatedRuntimeConfigurationForDeviceAuthorization() async throws {
+        let store = KeychainTokenStore(
+            service: "com.github-pr-inbox.tests.\(UUID().uuidString)",
+            account: "updated-runtime-configuration"
+        )
+        defer { try? store.deleteCredential() }
+
+        let session = makeMockSession { request in
+            let url = try #require(request.url)
+            #expect((url.host, url.path) == ("github.com", "/login/device/code"))
+            let body = formBody(in: request)
+            #expect(body.contains("client_id=Iv1.runtime"))
+            #expect(!body.contains("Iv1.initial"))
+            #expect(!body.contains("client_secret"))
+            return jsonResponse(
+                statusCode: 200,
+                body: """
+                {
+                  "device_code": "device-code-1",
+                  "user_code": "ABCD-EFGH",
+                  "verification_uri": "https://github.com/login/device",
+                  "expires_in": 900,
+                  "interval": 5
+                }
+                """
+            )
+        }
+        let provider = GitHubAuthProvider(
+            configuration: GitHubAuthConfiguration(
+                clientID: "Iv1.initial",
+                appSlug: "initial-app",
+                expectedOwners: []
+            ),
+            session: session,
+            tokenStore: store
+        )
+
+        await provider.updateConfiguration(
+            GitHubAuthConfiguration(
+                clientID: "Iv1.runtime",
+                appSlug: "runtime-app",
+                expectedOwners: ["acme"]
+            )
+        )
+        let authorization = try await provider.startSignIn(expectedScopes: [])
+
+        #expect(authorization.userCode == "ABCD-EFGH")
+    }
+
+    @Test
+    func changingAppIdentityPreventsInFlightValidationFromRestoringCredential() async throws {
+        let store = KeychainTokenStore(
+            service: "com.github-pr-inbox.tests.\(UUID().uuidString)",
+            account: "configuration-change-race"
+        )
+        defer { try? store.deleteCredential() }
+        try store.saveCredential(testCredential())
+
+        let requestStarted = DispatchSemaphore(value: 0)
+        let allowResponse = DispatchSemaphore(value: 0)
+        let session = makeMockSession { request in
+            let url = try #require(request.url)
+            #expect((url.host, url.path) == ("api.github.com", "/user/installations"))
+            requestStarted.signal()
+            #expect(allowResponse.wait(timeout: .now() + 5) == .success)
+            return jsonResponse(statusCode: 200, body: #"{ "installations": [] }"#)
+        }
+        let provider = GitHubAuthProvider(
+            configuration: GitHubAuthConfiguration(
+                clientID: "Iv1.old",
+                appSlug: "old-app",
+                expectedOwners: []
+            ),
+            session: session,
+            tokenStore: store
+        )
+
+        let validation = Task {
+            try await provider.validateOrgAccess(expectedScopes: [])
+        }
+        #expect(await waitForSemaphore(requestStarted, timeout: 2) == .success)
+
+        do {
+            try await provider.replaceConfigurationAndSignOut(
+                GitHubAuthConfiguration(
+                    clientID: "Iv1.new",
+                    appSlug: "new-app",
+                    expectedOwners: []
+                )
+            )
+        } catch {
+            allowResponse.signal()
+            throw error
+        }
+        allowResponse.signal()
+
+        do {
+            _ = try await validation.value
+            Issue.record("Expected in-flight validation to be invalidated by the configuration change.")
+        } catch let error as GitHubAuthError {
+            #expect(error == .configurationChanged)
+        }
+
+        #expect(try store.loadCredential() == nil)
+    }
+
+    @Test
+    func signingOutPreventsInFlightValidationFromRestoringCredential() async throws {
+        let store = KeychainTokenStore(
+            service: "com.github-pr-inbox.tests.\(UUID().uuidString)",
+            account: "sign-out-race"
+        )
+        defer { try? store.deleteCredential() }
+        try store.saveCredential(testCredential())
+
+        let requestStarted = DispatchSemaphore(value: 0)
+        let allowResponse = DispatchSemaphore(value: 0)
+        let session = makeDelayedInstallationSession(
+            requestStarted: requestStarted,
+            allowResponse: allowResponse
+        )
+        let provider = testProvider(session: session, store: store)
+        let validation = Task { try await provider.validateOrgAccess(expectedScopes: []) }
+        #expect(await waitForSemaphore(requestStarted, timeout: 2) == .success)
+
+        do {
+            try await provider.signOut()
+        } catch {
+            allowResponse.signal()
+            throw error
+        }
+        allowResponse.signal()
+
+        do {
+            _ = try await validation.value
+            Issue.record("Expected in-flight validation to be invalidated by sign-out.")
+        } catch let error as GitHubAuthError {
+            #expect(error == .configurationChanged)
+        }
+        #expect(try store.loadCredential() == nil)
+    }
+
+    @Test
+    func changingExpectedOwnersInvalidatesInFlightValidationWithoutSigningOut() async throws {
+        let store = KeychainTokenStore(
+            service: "com.github-pr-inbox.tests.\(UUID().uuidString)",
+            account: "expected-owner-race"
+        )
+        defer { try? store.deleteCredential() }
+        let credential = testCredential()
+        try store.saveCredential(credential)
+
+        let requestStarted = DispatchSemaphore(value: 0)
+        let allowResponse = DispatchSemaphore(value: 0)
+        let session = makeDelayedInstallationSession(
+            requestStarted: requestStarted,
+            allowResponse: allowResponse
+        )
+        let provider = testProvider(session: session, store: store)
+        let validation = Task { try await provider.validateOrgAccess(expectedScopes: []) }
+        #expect(await waitForSemaphore(requestStarted, timeout: 2) == .success)
+
+        await provider.updateConfiguration(
+            GitHubAuthConfiguration(
+                clientID: "Iv1.test",
+                appSlug: "github-pr-inbox",
+                expectedOwners: ["other-org"]
+            )
+        )
+        allowResponse.signal()
+
+        do {
+            _ = try await validation.value
+            Issue.record("Expected validation using the old organization configuration to be invalidated.")
+        } catch let error as GitHubAuthError {
+            #expect(error == .configurationChanged)
+        }
+        let storedCredential = try #require(try store.loadCredential())
+        #expect(storedCredential.accessToken == credential.accessToken)
+        #expect(storedCredential.refreshToken == credential.refreshToken)
+        #expect(storedCredential.authorizedOwners == credential.authorizedOwners)
+    }
+
+    @Test
     func reportsSAMLSSORequirementSeparatelyFromOtherAuthorizationFailures() async throws {
         let store = KeychainTokenStore(
             service: "com.github-pr-inbox.tests.\(UUID().uuidString)",
@@ -482,6 +667,34 @@ private func jsonResponse(statusCode: Int, body: String) -> (HTTPURLResponse, Da
         headerFields: ["Content-Type": "application/json"]
     )!
     return (response, Data(body.utf8))
+}
+
+private func makeDelayedInstallationSession(
+    requestStarted: DispatchSemaphore,
+    allowResponse: DispatchSemaphore
+) -> URLSession {
+    makeMockSession { request in
+        let url = try #require(request.url)
+        guard (url.host, url.path) == ("api.github.com", "/user/installations") else {
+            throw NSError(domain: "MockURLProtocol", code: 5)
+        }
+        requestStarted.signal()
+        guard allowResponse.wait(timeout: .now() + 5) == .success else {
+            throw NSError(domain: "MockURLProtocol", code: 6)
+        }
+        return jsonResponse(statusCode: 200, body: #"{ "installations": [] }"#)
+    }
+}
+
+private func waitForSemaphore(
+    _ semaphore: DispatchSemaphore,
+    timeout: TimeInterval
+) async -> DispatchTimeoutResult {
+    await withCheckedContinuation { continuation in
+        DispatchQueue.global().async {
+            continuation.resume(returning: semaphore.wait(timeout: .now() + timeout))
+        }
+    }
 }
 
 private actor RefreshTracker {

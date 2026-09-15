@@ -8,11 +8,17 @@ struct SettingsView: View {
 
     @State private var allowlistDraft = ""
     @State private var trackedWorkflowsDraft = ""
+    @State private var gitHubAppClientIDDraft = ""
+    @State private var gitHubAppSlugDraft = ""
+    @State private var gitHubAppExpectedOwnerDraft = ""
+    @State private var gitHubAppConfigurationError: String?
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 header
+                gitHubAppSection
+                Divider()
                 accountSection
                 Divider()
                 watchSection
@@ -24,10 +30,76 @@ struct SettingsView: View {
             .padding(24)
         }
         .background(Color(nsColor: .windowBackgroundColor))
-        .frame(minWidth: 620, minHeight: 560)
+        .frame(minWidth: 620, minHeight: 650)
         .task {
             allowlistDraft = settings.allowlistText
             trackedWorkflowsDraft = settings.trackedWorkflowNamesText
+            gitHubAppClientIDDraft = settings.gitHubAppClientID
+            gitHubAppSlugDraft = settings.gitHubAppSlug
+            gitHubAppExpectedOwnerDraft = settings.gitHubAppExpectedOwner
+        }
+    }
+
+    private var gitHubAppSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            sectionLabel("GitHub App")
+
+            Text("Enter the public Client ID and slug for your organization’s GitHub App. Do not enter a PAT, client secret, or private key.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            twoColumnRow(label: "Client ID") {
+                TextField("Iv1…", text: $gitHubAppClientIDDraft)
+                    .textFieldStyle(.roundedBorder)
+                    .autocorrectionDisabled()
+            }
+
+            twoColumnRow(label: "App slug") {
+                TextField("your-github-app", text: $gitHubAppSlugDraft)
+                    .textFieldStyle(.roundedBorder)
+                    .autocorrectionDisabled()
+            }
+
+            twoColumnRow(label: "Expected orgs") {
+                TextField("Optional organization logins, comma-separated", text: $gitHubAppExpectedOwnerDraft)
+                    .textFieldStyle(.roundedBorder)
+                    .autocorrectionDisabled()
+            }
+
+            Text("Changing the Client ID or app slug signs out the current GitHub session and requires reconnecting.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            HStack(spacing: 10) {
+                Button("Save GitHub App") {
+                    Task {
+                        do {
+                            try await model.saveGitHubAppConfiguration(
+                                clientID: gitHubAppClientIDDraft,
+                                appSlug: gitHubAppSlugDraft,
+                                expectedOwner: gitHubAppExpectedOwnerDraft
+                            )
+                            gitHubAppClientIDDraft = settings.gitHubAppClientID
+                            gitHubAppSlugDraft = settings.gitHubAppSlug
+                            gitHubAppExpectedOwnerDraft = settings.gitHubAppExpectedOwner
+                            gitHubAppConfigurationError = nil
+                        } catch {
+                            gitHubAppConfigurationError = error.localizedDescription
+                        }
+                    }
+                }
+                .disabled(!hasChangedGitHubAppConfiguration)
+
+                if model.appInstallURL != nil {
+                    Button("Open App Install Page") {
+                        model.openAppInstallationPage()
+                    }
+                }
+            }
+
+            if let gitHubAppConfigurationError {
+                authMessage(gitHubAppConfigurationError, tone: .warning)
+            }
         }
     }
 
@@ -344,6 +416,12 @@ struct SettingsView: View {
                 }
             }
         }
+    }
+
+    private var hasChangedGitHubAppConfiguration: Bool {
+        gitHubAppClientIDDraft != settings.gitHubAppClientID
+            || gitHubAppSlugDraft != settings.gitHubAppSlug
+            || gitHubAppExpectedOwnerDraft != settings.gitHubAppExpectedOwner
     }
 
     private enum AuthMessageTone {

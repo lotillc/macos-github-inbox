@@ -22,6 +22,7 @@ final class InboxViewModel: ObservableObject {
 
     private let settings: AppSettings
     private let authProvider: GitHubAuthProvider
+    private let clientSession: URLSession
     private var authoredSource: [PullRequestItem] = []
     private var reviewSource: [PullRequestItem] = []
     private var workflowFailureSource: [WorkflowFailureItem] = []
@@ -38,16 +39,19 @@ final class InboxViewModel: ObservableObject {
     private var authoredPullRequestNewItemTracker = NewItemTracker()
     private var workflowFailureNewItemTracker = NewItemTracker()
     private var signInTask: Task<Void, Never>?
+    private var connectionGeneration: UInt = 0
 
     private let authoredQualifier = "is:open is:pr archived:false author:@me"
     private let reviewQualifier = "is:open is:pr archived:false review-requested:@me"
 
     init(
         settings: AppSettings,
-        authProvider: GitHubAuthProvider = GitHubAuthProvider()
+        authProvider: GitHubAuthProvider = GitHubAuthProvider(),
+        clientSession: URLSession = .shared
     ) {
         self.settings = settings
         self.authProvider = authProvider
+        self.clientSession = clientSession
 
         bindSettings()
         configureRefreshTimer(minutes: settings.refreshIntervalMinutes)
@@ -90,11 +94,16 @@ final class InboxViewModel: ObservableObject {
     }
 
     var appInstallURL: URL? {
-        authProvider.configuration.appInstallationURL
+        settings.gitHubAppConfiguration.appInstallationURL
     }
 
     func refresh() async {
+        let generation = connectionGeneration
         await refreshAuthStatus()
+
+        guard isCurrentConnection(generation) else {
+            return
+        }
 
         guard authState.isAuthenticated else {
             clearLoadedData(resetStatus: false)
@@ -110,7 +119,11 @@ final class InboxViewModel: ObservableObject {
         }
 
         isLoading = true
-        defer { isLoading = false }
+        defer {
+            if isCurrentConnection(generation) {
+                isLoading = false
+            }
+        }
 
         do {
             let client = makeClient(scopes: scopes)
@@ -121,15 +134,27 @@ final class InboxViewModel: ObservableObject {
                 repositoryNames: settings.explicitRepositoryScopes,
                 trackedWorkflowNames: settings.trackedWorkflowNames
             )
+            let reviewResults = try await reviewItems
+            let authoredResults = try await authoredItems
+            let workflowResults = try await trackedWorkflowFailures
 
+            guard isCurrentConnection(generation) else {
+                return
+            }
             currentUser = user
-            reviewSource = try await reviewItems
-            authoredSource = try await authoredItems
-            workflowFailureSource = try await trackedWorkflowFailures
+            reviewSource = reviewResults
+            authoredSource = authoredResults
+            workflowFailureSource = workflowResults
             applySnapshot()
             lastRefreshAt = Date()
-            await updateWorkflowFailureAlerts()
-            await refreshCIStatusesForVisibleItems()
+            await updateWorkflowFailureAlerts(connectionGeneration: generation)
+            guard isCurrentConnection(generation) else {
+                return
+            }
+            await refreshCIStatusesForVisibleItems(connectionGeneration: generation)
+            guard isCurrentConnection(generation) else {
+                return
+            }
 
             if reviewRequests.isEmpty && authoredPullRequests.isEmpty && workflowFailures.isEmpty {
                 statusMessage = "No open PRs matched your current filters."
@@ -137,6 +162,9 @@ final class InboxViewModel: ObservableObject {
                 statusMessage = nil
             }
         } catch {
+            guard isCurrentConnection(generation) else {
+                return
+            }
             clearLoadedData(resetStatus: true)
             mapRefreshError(error)
             statusMessage = error.localizedDescription
@@ -144,11 +172,19 @@ final class InboxViewModel: ObservableObject {
     }
 
     func beginSignIn() async {
+        invalidateConnection()
+        let generation = connectionGeneration
         signInTask?.cancel()
         authStatusMessage = nil
 
         do {
+            await authProvider.cancelPendingAuthorization()
+            let configuration = settings.gitHubAppConfiguration
+            await authProvider.updateConfiguration(configuration)
             let authorization = try await authProvider.startSignIn(expectedScopes: settings.scopes)
+            guard isCurrentConnection(generation), configuration == settings.gitHubAppConfiguration else {
+                return
+            }
             authState = .authorizing(authorization)
             copyVerificationCodeToPasteboard(authorization.userCode)
             NSWorkspace.shared.open(authorization.browserURL)
@@ -158,25 +194,40 @@ final class InboxViewModel: ObservableObject {
                 await self?.completePendingAuthPoll()
             }
         } catch {
+            guard isCurrentConnection(generation) else {
+                return
+            }
             mapAuthError(error)
         }
     }
 
     func cancelSignIn() {
+        invalidateConnection()
+        let generation = connectionGeneration
         signInTask?.cancel()
         signInTask = nil
 
         Task {
             await authProvider.cancelPendingAuthorization()
+            guard self.isCurrentConnection(generation) else {
+                return
+            }
             await refreshAuthStatus()
+            guard self.isCurrentConnection(generation) else {
+                return
+            }
             authStatusMessage = "Canceled GitHub sign-in."
         }
     }
 
     func completePendingAuthPoll() async {
+        let generation = connectionGeneration
         while !Task.isCancelled {
             do {
                 let result = try await authProvider.pollSignIn(expectedScopes: settings.scopes)
+                guard isCurrentConnection(generation) else {
+                    return
+                }
 
                 switch result {
                 case let .pending(authorization):
@@ -194,6 +245,9 @@ final class InboxViewModel: ObservableObject {
             } catch is CancellationError {
                 return
             } catch {
+                guard isCurrentConnection(generation) else {
+                    return
+                }
                 signInTask = nil
                 mapAuthError(error)
                 return
@@ -202,12 +256,17 @@ final class InboxViewModel: ObservableObject {
     }
 
     func signOut() {
+        invalidateConnection()
+        let generation = connectionGeneration
         signInTask?.cancel()
         signInTask = nil
 
         Task {
             do {
                 try await authProvider.signOut()
+                guard self.isCurrentConnection(generation) else {
+                    return
+                }
                 settings.reloadCredentialPresence()
                 currentUser = nil
                 authState = .signedOut
@@ -221,29 +280,47 @@ final class InboxViewModel: ObservableObject {
     }
 
     func refreshAuthStatus() async {
+        let generation = connectionGeneration
         settings.reloadCredentialPresence()
 
-        if let configurationMessage = authProvider.configuration.missingConfigurationMessage {
+        let configuration = settings.gitHubAppConfiguration
+        await authProvider.updateConfiguration(configuration)
+
+        guard isCurrentConnection(generation) else {
+            return
+        }
+
+        if let configurationMessage = configuration.missingConfigurationMessage {
             authState = .missingConfiguration(configurationMessage)
             currentUser = nil
             return
         }
 
         if let pendingAuthorization = await authProvider.pendingAuthorizationState() {
+            guard isCurrentConnection(generation) else {
+                return
+            }
             authState = .authorizing(pendingAuthorization)
             return
         }
 
         do {
             guard let credential = try await authProvider.currentCredential() else {
+                guard isCurrentConnection(generation) else {
+                    return
+                }
                 authState = .signedOut
                 currentUser = nil
                 return
             }
 
+            guard isCurrentConnection(generation), configuration == settings.gitHubAppConfiguration else {
+                return
+            }
+
             currentUser = GitHubUser(login: credential.userLogin)
 
-            if settings.scopes.isEmpty {
+            if settings.scopes.isEmpty && configuration.expectedOwners.isEmpty {
                 authState = .signedIn(
                     GitHubSessionSummary(
                         user: GitHubUser(login: credential.userLogin),
@@ -257,9 +334,15 @@ final class InboxViewModel: ObservableObject {
             }
 
             let summary = try await authProvider.validateOrgAccess(expectedScopes: settings.scopes)
+            guard isCurrentConnection(generation), configuration == settings.gitHubAppConfiguration else {
+                return
+            }
             currentUser = summary.user
             authState = .signedIn(summary)
         } catch {
+            guard isCurrentConnection(generation) else {
+                return
+            }
             mapAuthError(error)
         }
     }
@@ -275,13 +358,14 @@ final class InboxViewModel: ObservableObject {
     }
 
     func openSSOAuthorization() {
-        let owners = ssoOwnerList()
-        for owner in owners {
-            guard let url = URL(string: "https://github.com/orgs/\(owner)/sso") else {
-                continue
-            }
-
+        for url in ssoAuthorizationURLs {
             NSWorkspace.shared.open(url)
+        }
+    }
+
+    var ssoAuthorizationURLs: [URL] {
+        ssoOwnerList().compactMap { owner in
+            URL(string: "https://github.com/orgs/\(owner)/sso")
         }
     }
 
@@ -302,6 +386,58 @@ final class InboxViewModel: ObservableObject {
         }
 
         NSWorkspace.shared.open(url)
+    }
+
+    func saveGitHubAppConfiguration(
+        clientID: String,
+        appSlug: String,
+        expectedOwner: String
+    ) async throws {
+        let previousConfiguration = settings.gitHubAppConfiguration
+        let proposedConfiguration = GitHubAuthConfiguration(
+            clientID: clientID,
+            appSlug: appSlug,
+            expectedOwners: GitHubAuthConfiguration.expectedOwners(from: expectedOwner)
+        )
+
+        if let message = proposedConfiguration.missingConfigurationMessage {
+            throw GitHubAuthError.missingConfiguration(message)
+        }
+
+        let appIdentityChanged = previousConfiguration.clientID != proposedConfiguration.clientID
+            || previousConfiguration.appSlug != proposedConfiguration.appSlug
+        let configurationChanged = previousConfiguration != proposedConfiguration
+
+        if configurationChanged {
+            invalidateConnection()
+        }
+
+        if appIdentityChanged {
+            signInTask?.cancel()
+            signInTask = nil
+            try await authProvider.replaceConfigurationAndSignOut(proposedConfiguration)
+        }
+
+        let savedConfiguration = try settings.saveGitHubAppConfiguration(
+            clientID: proposedConfiguration.clientID,
+            appSlug: proposedConfiguration.appSlug,
+            expectedOwner: proposedConfiguration.expectedOwners.joined(separator: ", ")
+        )
+        if !appIdentityChanged {
+            await authProvider.updateConfiguration(savedConfiguration)
+        }
+        settings.reloadCredentialPresence()
+
+        if appIdentityChanged {
+            currentUser = nil
+            authState = .signedOut
+            authStatusMessage = "GitHub App changed. Reconnect to GitHub."
+            statusMessage = "Sign in with GitHub in Settings to load pull requests."
+            clearLoadedData(resetStatus: true)
+            return
+        }
+
+        await refreshAuthStatus()
     }
 
     func ciStatus(for item: PullRequestItem) -> PullRequestCIStatus {
@@ -325,6 +461,13 @@ final class InboxViewModel: ObservableObject {
     }
 
     func refreshCIStatuses(for items: [PullRequestItem]) async {
+        await refreshCIStatuses(for: items, connectionGeneration: connectionGeneration)
+    }
+
+    private func refreshCIStatuses(
+        for items: [PullRequestItem],
+        connectionGeneration: UInt
+    ) async {
         guard authState.isAuthenticated else {
             return
         }
@@ -351,6 +494,10 @@ final class InboxViewModel: ObservableObject {
         do {
             let snapshotsByItemID = try await client.fetchCIStatusSnapshots(for: uncachedItems)
 
+            guard isCurrentConnection(connectionGeneration) else {
+                return
+            }
+
             for item in uncachedItems {
                 if let snapshot = snapshotsByItemID[item.id] {
                     ciStatusCache[item.id] = (updatedAt: item.updatedAt, snapshot: snapshot)
@@ -362,6 +509,9 @@ final class InboxViewModel: ObservableObject {
                 }
             }
         } catch {
+            guard isCurrentConnection(connectionGeneration) else {
+                return
+            }
             for item in uncachedItems {
                 ciStatusesByPullRequestID[item.id] = .unknown
                 ciDebugSummariesByPullRequestID[item.id] = "error=\(error.localizedDescription)"
@@ -375,7 +525,10 @@ final class InboxViewModel: ObservableObject {
             }
         }
 
-        await updateCIFailureAlerts(for: items)
+        guard isCurrentConnection(connectionGeneration) else {
+            return
+        }
+        await updateCIFailureAlerts(for: items, connectionGeneration: connectionGeneration)
     }
 
     private func bindSettings() {
@@ -474,15 +627,15 @@ final class InboxViewModel: ObservableObject {
     }
 
     private func makeClient(scopes: [RepositoryScope]) -> GitHubClient {
-        GitHubClient(authProvider: authProvider, scopes: scopes)
+        GitHubClient(session: clientSession, authProvider: authProvider, scopes: scopes)
     }
 
-    private func refreshCIStatusesForVisibleItems() async {
+    private func refreshCIStatusesForVisibleItems(connectionGeneration: UInt) async {
         let currentVisibleItems = Array(reviewRequests.prefix(24)) + Array(authoredPullRequests.prefix(24))
-        await refreshCIStatuses(for: currentVisibleItems)
+        await refreshCIStatuses(for: currentVisibleItems, connectionGeneration: connectionGeneration)
     }
 
-    private func updateWorkflowFailureAlerts() async {
+    private func updateWorkflowFailureAlerts(connectionGeneration: UInt) async {
         let currentFailureIDs = Set(workflowFailures.map(\.id))
         activeWorkflowFailureAlertIDs = activeWorkflowFailureAlertIDs.intersection(currentFailureIDs)
 
@@ -507,10 +660,16 @@ final class InboxViewModel: ObservableObject {
                 title: "Workflow Failed",
                 body: "\(failure.workflowName) failed in \(failure.repositoryName)"
             )
+            guard isCurrentConnection(connectionGeneration) else {
+                return
+            }
         }
     }
 
-    private func updateCIFailureAlerts(for items: [PullRequestItem]) async {
+    private func updateCIFailureAlerts(
+        for items: [PullRequestItem],
+        connectionGeneration: UInt
+    ) async {
         let currentFailureIDs = Set(
             items
                 .filter { ciStatusesByPullRequestID[$0.id] == .failure }
@@ -541,6 +700,9 @@ final class InboxViewModel: ObservableObject {
                 title: "CI Failed",
                 body: "\(item.repositoryName) #\(item.number) failed checks"
             )
+            guard isCurrentConnection(connectionGeneration) else {
+                return
+            }
         }
     }
 
@@ -585,6 +747,15 @@ final class InboxViewModel: ObservableObject {
         applySnapshot(newItemTracking: .reset)
     }
 
+    private func invalidateConnection() {
+        connectionGeneration &+= 1
+        isLoading = false
+    }
+
+    private func isCurrentConnection(_ generation: UInt) -> Bool {
+        connectionGeneration == generation
+    }
+
     private func copyVerificationCodeToPasteboard(_ code: String) {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
@@ -597,7 +768,7 @@ final class InboxViewModel: ObservableObject {
             switch authError {
             case let .missingConfiguration(message):
                 authState = .missingConfiguration(message)
-            case .signedOut:
+            case .signedOut, .configurationChanged:
                 authState = .signedOut
                 currentUser = nil
             case .pendingAuthorizationRequired:
@@ -647,7 +818,9 @@ final class InboxViewModel: ObservableObject {
     }
 
     private func watchedOwners() -> [String] {
-        Array(Set(settings.scopes.map { $0.ownerName.lowercased() })).sorted()
+        let configuredOwners = settings.gitHubAppConfiguration.expectedOwners.map { $0.lowercased() }
+        let scopeOwners = settings.scopes.map { $0.ownerName.lowercased() }
+        return Array(Set(configuredOwners + scopeOwners)).sorted()
     }
 
     private func ssoOwnerList() -> [String] {

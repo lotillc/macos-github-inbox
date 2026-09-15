@@ -13,21 +13,35 @@ struct GitHubAuthConfiguration: Equatable {
     let appSlug: String
     let expectedOwners: [String]
 
+    init(clientID: String, appSlug: String, expectedOwners: [String]) {
+        self.clientID = Self.trimmed(clientID)
+        self.appSlug = Self.trimmed(appSlug)
+        self.expectedOwners = expectedOwners
+            .map(Self.trimmed)
+            .filter { !$0.isEmpty }
+    }
+
     static func load(
         bundle: Bundle = .main,
         processInfo: ProcessInfo = .processInfo
     ) -> GitHubAuthConfiguration {
-        func trimmed(_ value: String?) -> String {
-            value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        }
+        load(
+            environment: processInfo.environment,
+            infoDictionary: bundle.infoDictionary ?? [:]
+        )
+    }
 
+    static func load(
+        environment: [String: String],
+        infoDictionary: [String: Any]
+    ) -> GitHubAuthConfiguration {
         func value(environmentKey: String, infoKey: String) -> String {
-            let environmentValue = trimmed(processInfo.environment[environmentKey])
+            let environmentValue = defaultValue(environment[environmentKey])
             if !environmentValue.isEmpty {
                 return environmentValue
             }
 
-            return trimmed(bundle.object(forInfoDictionaryKey: infoKey) as? String)
+            return defaultValue(infoDictionary[infoKey] as? String)
         }
 
         let expectedOwnersValue = value(
@@ -38,11 +52,15 @@ struct GitHubAuthConfiguration: Equatable {
         return GitHubAuthConfiguration(
             clientID: value(environmentKey: Self.clientIDEnvironmentKey, infoKey: Self.clientIDInfoKey),
             appSlug: value(environmentKey: Self.appSlugEnvironmentKey, infoKey: Self.appSlugInfoKey),
-            expectedOwners: expectedOwnersValue
-                .split(whereSeparator: { $0 == "," || $0.isNewline })
-                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .filter { !$0.isEmpty }
+            expectedOwners: expectedOwners(from: expectedOwnersValue)
         )
+    }
+
+    static func expectedOwners(from value: String) -> [String] {
+        value
+            .split(whereSeparator: { $0 == "," || $0.isNewline })
+            .map { trimmed(String($0)) }
+            .filter { !$0.isEmpty }
     }
 
     var missingConfigurationMessage: String? {
@@ -56,19 +74,48 @@ struct GitHubAuthConfiguration: Equatable {
             missingFields.append("GitHub App slug")
         }
 
-        guard !missingFields.isEmpty else {
-            return nil
+        if !missingFields.isEmpty {
+            return "Configure \(missingFields.joined(separator: " and ")) in Settings before signing in."
         }
 
-        return "Configure \(missingFields.joined(separator: " and ")) before signing in."
+        if clientID.rangeOfCharacter(from: .whitespacesAndNewlines) != nil {
+            return "GitHub App client ID cannot contain whitespace. Update it in Settings."
+        }
+
+        if !Self.isGitHubIdentifier(appSlug) {
+            return "GitHub App slug may only contain letters, numbers, and hyphens. Update it in Settings."
+        }
+
+        if expectedOwners.contains(where: { !Self.isGitHubIdentifier($0) }) {
+            return "Expected organization may only contain letters, numbers, and hyphens. Update it in Settings."
+        }
+
+        return nil
     }
 
     var appInstallationURL: URL? {
-        guard !appSlug.isEmpty else {
+        guard missingConfigurationMessage == nil else {
             return nil
         }
 
         return URL(string: "https://github.com/apps/\(appSlug)/installations/new")
+    }
+
+    private static func trimmed(_ value: String?) -> String {
+        value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    private static func defaultValue(_ value: String?) -> String {
+        let value = trimmed(value)
+        if value.hasPrefix("$("), value.hasSuffix(")") {
+            return ""
+        }
+
+        return value
+    }
+
+    private static func isGitHubIdentifier(_ value: String) -> Bool {
+        value.range(of: "^[A-Za-z0-9][A-Za-z0-9-]*$", options: .regularExpression) != nil
     }
 }
 
@@ -167,6 +214,7 @@ enum GitHubAuthPollingResult: Equatable {
 enum GitHubAuthError: LocalizedError, Equatable {
     case missingConfiguration(String)
     case signedOut
+    case configurationChanged
     case pendingAuthorizationRequired
     case authorizationDenied(String)
     case authorizationExpired(String)
@@ -189,6 +237,8 @@ enum GitHubAuthError: LocalizedError, Equatable {
             return message
         case .signedOut:
             return "Sign in with GitHub in Settings."
+        case .configurationChanged:
+            return "GitHub App settings changed. Reconnect to GitHub."
         case .pendingAuthorizationRequired:
             return "Start GitHub sign-in before polling for completion."
         }
@@ -196,7 +246,10 @@ enum GitHubAuthError: LocalizedError, Equatable {
 }
 
 actor GitHubAuthProvider {
-    nonisolated let configuration: GitHubAuthConfiguration
+    private struct AuthenticationContext {
+        let configuration: GitHubAuthConfiguration
+        let generation: UInt
+    }
 
     private struct DeviceCodeResponse: Decodable {
         let deviceCode: String
@@ -282,6 +335,8 @@ actor GitHubAuthProvider {
     private let session: URLSession
     private let tokenStore: KeychainTokenStore
     private let decoder: JSONDecoder
+    private var configuration: GitHubAuthConfiguration
+    private var configurationGeneration: UInt = 0
     private var pendingAuthorization: GitHubDeviceAuthorization?
 
     init(
@@ -302,12 +357,32 @@ actor GitHubAuthProvider {
         try tokenStore.loadCredential()
     }
 
+    func updateConfiguration(_ configuration: GitHubAuthConfiguration) {
+        guard configuration != self.configuration else {
+            return
+        }
+
+        configurationGeneration &+= 1
+        if isDifferentAppIdentity(configuration, self.configuration) {
+            pendingAuthorization = nil
+        }
+        self.configuration = configuration
+    }
+
+    func replaceConfigurationAndSignOut(_ configuration: GitHubAuthConfiguration) throws {
+        configurationGeneration &+= 1
+        pendingAuthorization = nil
+        try tokenStore.deleteCredential()
+        self.configuration = configuration
+    }
+
     func pendingAuthorizationState() -> GitHubDeviceAuthorization? {
         pendingAuthorization
     }
 
     func startSignIn(expectedScopes: [RepositoryScope]) async throws -> GitHubDeviceAuthorization {
-        try ensureConfigured()
+        let context = try configuredContext()
+        let configuration = context.configuration
 
         let url = URL(string: "https://github.com/login/device/code")!
         let request = try formRequest(
@@ -316,6 +391,7 @@ actor GitHubAuthProvider {
         )
         let data = try await send(request)
         let response = try decode(DeviceCodeResponse.self, from: data)
+        try ensureCurrent(context)
 
         let authorization = GitHubDeviceAuthorization(
             deviceCode: response.deviceCode,
@@ -331,7 +407,8 @@ actor GitHubAuthProvider {
     }
 
     func pollSignIn(expectedScopes: [RepositoryScope]) async throws -> GitHubAuthPollingResult {
-        try ensureConfigured()
+        let context = try configuredContext()
+        let configuration = context.configuration
 
         guard var authorization = pendingAuthorization else {
             throw GitHubAuthError.pendingAuthorizationRequired
@@ -353,6 +430,7 @@ actor GitHubAuthProvider {
         )
         let data = try await send(request)
         let response = try decode(TokenResponse.self, from: data)
+        try ensureCurrent(context)
 
         if let error = response.error {
             switch error {
@@ -386,6 +464,7 @@ actor GitHubAuthProvider {
         }
 
         let user = try await fetchCurrentUser(token: accessToken)
+        try ensureCurrent(context)
         var credential = GitHubCredential(
             accessToken: accessToken,
             refreshToken: response.refreshToken,
@@ -401,13 +480,16 @@ actor GitHubAuthProvider {
         do {
             let validation = try await fetchAccessValidation(
                 token: accessToken,
-                expectedScopes: expectedScopes
+                expectedScopes: expectedScopes,
+                configuration: configuration
             )
             credential = credential.updating(validation: validation)
+            try ensureCurrent(context)
             try tokenStore.saveCredential(credential)
             pendingAuthorization = nil
             return .completed(credential)
         } catch let error as GitHubAuthError {
+            try ensureCurrent(context)
             try tokenStore.saveCredential(credential)
             pendingAuthorization = nil
             throw error
@@ -415,7 +497,8 @@ actor GitHubAuthProvider {
     }
 
     func refreshIfNeeded(expectedScopes: [RepositoryScope]) async throws -> GitHubCredential {
-        try ensureConfigured()
+        let context = try configuredContext()
+        let configuration = context.configuration
 
         guard let credential = try tokenStore.loadCredential() else {
             throw GitHubAuthError.signedOut
@@ -430,17 +513,28 @@ actor GitHubAuthProvider {
             return credential
         }
 
-        return try await refreshCredential(credential, expectedScopes: expectedScopes)
+        return try await refreshCredential(
+            credential,
+            expectedScopes: expectedScopes,
+            configuration: configuration,
+            context: context
+        )
     }
 
     func forceRefresh(expectedScopes: [RepositoryScope]) async throws -> GitHubCredential {
-        try ensureConfigured()
+        let context = try configuredContext()
+        let configuration = context.configuration
 
         guard let credential = try tokenStore.loadCredential() else {
             throw GitHubAuthError.signedOut
         }
 
-        return try await refreshCredential(credential, expectedScopes: expectedScopes)
+        return try await refreshCredential(
+            credential,
+            expectedScopes: expectedScopes,
+            configuration: configuration,
+            context: context
+        )
     }
 
     func validAccessToken(expectedScopes: [RepositoryScope]) async throws -> String {
@@ -448,12 +542,17 @@ actor GitHubAuthProvider {
     }
 
     func validateOrgAccess(expectedScopes: [RepositoryScope]) async throws -> GitHubSessionSummary {
+        let context = try configuredContext()
+        let configuration = context.configuration
         let credential = try await refreshIfNeeded(expectedScopes: expectedScopes)
+        try ensureCurrent(context)
         let validation = try await fetchAccessValidation(
             token: credential.accessToken,
-            expectedScopes: expectedScopes
+            expectedScopes: expectedScopes,
+            configuration: configuration
         )
         let updatedCredential = credential.updating(validation: validation)
+        try ensureCurrent(context)
         try tokenStore.saveCredential(updatedCredential)
 
         return GitHubSessionSummary(
@@ -466,17 +565,21 @@ actor GitHubAuthProvider {
     }
 
     func signOut() throws {
+        configurationGeneration &+= 1
         pendingAuthorization = nil
         try tokenStore.deleteCredential()
     }
 
     func cancelPendingAuthorization() {
+        configurationGeneration &+= 1
         pendingAuthorization = nil
     }
 
     private func refreshCredential(
         _ credential: GitHubCredential,
-        expectedScopes: [RepositoryScope]
+        expectedScopes: [RepositoryScope],
+        configuration: GitHubAuthConfiguration,
+        context: AuthenticationContext
     ) async throws -> GitHubCredential {
         guard let refreshToken = credential.refreshToken else {
             throw GitHubAuthError.refreshFailed("GitHub sign-in expired. Reconnect in Settings.")
@@ -513,6 +616,7 @@ actor GitHubAuthProvider {
         }
 
         let user = try await fetchCurrentUser(token: accessToken)
+        try ensureCurrent(context)
         var updatedCredential = GitHubCredential(
             accessToken: accessToken,
             refreshToken: response.refreshToken ?? credential.refreshToken,
@@ -529,12 +633,15 @@ actor GitHubAuthProvider {
         do {
             let validation = try await fetchAccessValidation(
                 token: accessToken,
-                expectedScopes: expectedScopes
+                expectedScopes: expectedScopes,
+                configuration: configuration
             )
             updatedCredential = updatedCredential.updating(validation: validation)
+            try ensureCurrent(context)
             try tokenStore.saveCredential(updatedCredential)
             return updatedCredential
         } catch let error as GitHubAuthError {
+            try ensureCurrent(context)
             try tokenStore.saveCredential(updatedCredential)
             throw error
         }
@@ -549,7 +656,8 @@ actor GitHubAuthProvider {
 
     private func fetchAccessValidation(
         token: String,
-        expectedScopes: [RepositoryScope]
+        expectedScopes: [RepositoryScope],
+        configuration: GitHubAuthConfiguration
     ) async throws -> GitHubAccessValidation {
         let installations = try await fetchInstallations(token: token)
         let explicitRepositories = Set(expectedScopes.compactMap { scope -> String? in
@@ -679,10 +787,28 @@ actor GitHubAuthProvider {
         return repositories
     }
 
-    private func ensureConfigured() throws {
+    private func configuredContext() throws -> AuthenticationContext {
         if let message = configuration.missingConfigurationMessage {
             throw GitHubAuthError.missingConfiguration(message)
         }
+
+        return AuthenticationContext(
+            configuration: configuration,
+            generation: configurationGeneration
+        )
+    }
+
+    private func ensureCurrent(_ context: AuthenticationContext) throws {
+        guard context.generation == configurationGeneration else {
+            throw GitHubAuthError.configurationChanged
+        }
+    }
+
+    private func isDifferentAppIdentity(
+        _ lhs: GitHubAuthConfiguration,
+        _ rhs: GitHubAuthConfiguration
+    ) -> Bool {
+        lhs.clientID != rhs.clientID || lhs.appSlug != rhs.appSlug
     }
 
     private func formRequest(url: URL, parameters: [String: String]) throws -> URLRequest {
