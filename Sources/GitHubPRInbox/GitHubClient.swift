@@ -8,6 +8,7 @@ enum GitHubClientError: LocalizedError {
     case missingToken
     case configuration(String)
     case unauthorized(String)
+    case rateLimited(String)
     case invalidResponse(String)
     case network(String)
 
@@ -18,6 +19,8 @@ enum GitHubClientError: LocalizedError {
         case let .configuration(message):
             message
         case let .unauthorized(message):
+            message
+        case let .rateLimited(message):
             message
         case let .invalidResponse(message):
             message
@@ -575,7 +578,10 @@ actor GitHubClient {
                     )
                 }
 
-                throw mapHTTPError(statusCode: httpResponse.statusCode, bodyData: data)
+                let headers = httpResponse.allHeaderFields.reduce(into: [String: String]()) { result, header in
+                    result[String(describing: header.key).lowercased()] = String(describing: header.value)
+                }
+                throw mapHTTPError(statusCode: httpResponse.statusCode, bodyData: data, headers: headers)
             }
 
             return data
@@ -900,27 +906,47 @@ actor GitHubClient {
         }
     }
 
-    private func mapHTTPError(statusCode: Int, bodyData: Data) -> GitHubClientError {
+    private func mapHTTPError(
+        statusCode: Int,
+        bodyData: Data,
+        headers: [String: String]
+    ) -> GitHubClientError {
         let apiError = try? decoder.decode(APIErrorResponse.self, from: bodyData)
         let message = apiError?.message ?? String(decoding: bodyData, as: UTF8.self)
 
         switch statusCode {
         case 401:
             return .unauthorized("Your GitHub authorization is invalid, expired, or revoked.")
-        case 403:
+        case 403, 429:
             let normalizedMessage = message.lowercased()
+            if statusCode == 429 || isRateLimited(headers: headers, normalizedMessage: normalizedMessage) {
+                return .rateLimited(rateLimitMessage(headers: headers))
+            }
             if normalizedMessage.contains("saml") || normalizedMessage.contains("single sign-on") {
                 return .unauthorized("Your GitHub authorization needs SSO for one or more selected repositories.")
-            }
-
-            if normalizedMessage.contains("rate limit") {
-                return .unauthorized("GitHub rate limited this session. Wait a bit and refresh again.")
             }
 
             return .unauthorized(message.isEmpty ? "GitHub denied access to one or more selected repositories." : message)
         default:
             return .invalidResponse("GitHub API error \(statusCode): \(message)")
         }
+    }
+
+    private func isRateLimited(headers: [String: String], normalizedMessage: String) -> Bool {
+        normalizedMessage.contains("rate limit")
+            || headers["x-ratelimit-remaining"] == "0"
+            || headers["retry-after"] != nil
+    }
+
+    private func rateLimitMessage(headers: [String: String]) -> String {
+        if let retryAfter = headers["retry-after"] {
+            return "GitHub rate limit reached. Try again in \(retryAfter) seconds."
+        }
+        if let resetValue = headers["x-ratelimit-reset"], let timestamp = TimeInterval(resetValue) {
+            let resetDate = Date(timeIntervalSince1970: timestamp)
+            return "GitHub rate limit reached. Try again after \(resetDate.formatted(date: .omitted, time: .shortened))."
+        }
+        return "GitHub rate limit reached. Try again shortly."
     }
 
     private func convertSearchItem(_ item: SearchItem) throws -> PullRequestItem {

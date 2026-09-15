@@ -92,7 +92,16 @@ final class InboxViewModel: ObservableObject {
     }
 
     var hasConfigurationIssue: Bool {
-        settings.scopes.isEmpty || !authState.isAuthenticated
+        guard !settings.scopes.isEmpty else {
+            return true
+        }
+
+        switch authState {
+        case .signedIn, .rateLimited:
+            return false
+        default:
+            return true
+        }
     }
 
     var appInstallURL: URL? {
@@ -105,6 +114,15 @@ final class InboxViewModel: ObservableObject {
 
     var availableRepositoryOwners: [String] {
         repositoryInventorySummary?.authorizedOwners.sorted() ?? []
+    }
+
+    var availableOrganizationOwners: [String] {
+        repositoryInventorySummary?.organizationOwners.sorted() ?? []
+    }
+
+    var availablePersonalAccountOwners: [String] {
+        let organizations = Set(availableOrganizationOwners.map { $0.lowercased() })
+        return availableRepositoryOwners.filter { !organizations.contains($0.lowercased()) }
     }
 
     func refresh() async {
@@ -178,6 +196,11 @@ final class InboxViewModel: ObservableObject {
             }
         } catch {
             guard isCurrentConnection(generation) else {
+                return
+            }
+            if case .rateLimited = error as? GitHubClientError {
+                mapRefreshError(error)
+                statusMessage = error.localizedDescription
                 return
             }
             clearLoadedData(resetStatus: true)
@@ -328,11 +351,16 @@ final class InboxViewModel: ObservableObject {
 
         do {
             guard let credential = try await authProvider.currentCredential() else {
+                // A device grant can be durable before the first profile lookup
+                // completes. Let validation resume that pending Keychain record
+                // instead of presenting an already-issued token as signed out.
+                let summary = try await authProvider.validateOrgAccess(expectedScopes: settings.scopes)
                 guard isCurrentConnection(generation) else {
                     return
                 }
-                authState = .signedOut
-                currentUser = nil
+                currentUser = summary.user
+                setAuthenticatedSession(summary)
+                settings.reloadCredentialPresence()
                 return
             }
 
@@ -346,9 +374,15 @@ final class InboxViewModel: ObservableObject {
                 tokenExpiresAt: credential.accessTokenExpiresAt,
                 refreshTokenExpiresAt: credential.refreshTokenExpiresAt,
                 authorizedOwners: credential.authorizedOwners,
-                accessibleRepositories: credential.accessibleRepositories
+                accessibleRepositories: credential.accessibleRepositories,
+                organizationOwners: credential.organizationOwners ?? lastKnownSessionSummary?.organizationOwners ?? []
             )
-            lastKnownSessionSummary = credentialSummary
+            // Preserve the last successful owner classification if the next
+            // validation is rate limited; credentials intentionally do not store
+            // that display-only installation metadata.
+            if lastKnownSessionSummary == nil {
+                lastKnownSessionSummary = credentialSummary
+            }
 
             if settings.scopes.isEmpty && configuration.expectedOwners.isEmpty {
                 setAuthenticatedSession(credentialSummary)
@@ -467,6 +501,16 @@ final class InboxViewModel: ObservableObject {
         }
 
         await refreshAuthStatus()
+
+        // An expected-organization change preserves the GitHub device code, but
+        // invalidates the old task generation. Resume it so Settings does not
+        // remain stuck in “authorizing” with no poll in flight.
+        if case .authorizing = authState {
+            signInTask?.cancel()
+            signInTask = Task { [weak self] in
+                await self?.completePendingAuthPoll()
+            }
+        }
     }
 
     func ciStatus(for item: PullRequestItem) -> PullRequestCIStatus {
@@ -871,6 +915,8 @@ final class InboxViewModel: ObservableObject {
                 }
             case let .configuration(message):
                 authState = .refreshFailed(message)
+            case let .rateLimited(message):
+                authState = .rateLimited(message)
             case let .invalidResponse(message),
                  let .network(message):
                 authStatusMessage = message

@@ -137,7 +137,55 @@ struct GitHubCredential: Codable, Equatable {
     let userLogin: String
     let authorizedOwners: [String]
     let accessibleRepositories: [String]
+    /// Optional for backward-compatible decoding of credentials saved before
+    /// installation account types were recorded.
+    let organizationOwners: [String]?
     let lastValidatedAt: Date?
+
+    init(
+        accessToken: String,
+        refreshToken: String?,
+        accessTokenExpiresAt: Date?,
+        refreshTokenExpiresAt: Date?,
+        userID: Int,
+        userLogin: String,
+        authorizedOwners: [String],
+        accessibleRepositories: [String],
+        organizationOwners: [String]? = nil,
+        lastValidatedAt: Date?
+    ) {
+        self.accessToken = accessToken
+        self.refreshToken = refreshToken
+        self.accessTokenExpiresAt = accessTokenExpiresAt
+        self.refreshTokenExpiresAt = refreshTokenExpiresAt
+        self.userID = userID
+        self.userLogin = userLogin
+        self.authorizedOwners = authorizedOwners
+        self.accessibleRepositories = accessibleRepositories
+        self.organizationOwners = organizationOwners
+        self.lastValidatedAt = lastValidatedAt
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case accessToken, refreshToken, accessTokenExpiresAt, refreshTokenExpiresAt
+        case userID, userLogin, authorizedOwners, accessibleRepositories, organizationOwners, lastValidatedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            accessToken: try values.decode(String.self, forKey: .accessToken),
+            refreshToken: try values.decodeIfPresent(String.self, forKey: .refreshToken),
+            accessTokenExpiresAt: try values.decodeIfPresent(Date.self, forKey: .accessTokenExpiresAt),
+            refreshTokenExpiresAt: try values.decodeIfPresent(Date.self, forKey: .refreshTokenExpiresAt),
+            userID: try values.decode(Int.self, forKey: .userID),
+            userLogin: try values.decode(String.self, forKey: .userLogin),
+            authorizedOwners: try values.decode([String].self, forKey: .authorizedOwners),
+            accessibleRepositories: try values.decode([String].self, forKey: .accessibleRepositories),
+            organizationOwners: try values.decodeIfPresent([String].self, forKey: .organizationOwners),
+            lastValidatedAt: try values.decodeIfPresent(Date.self, forKey: .lastValidatedAt)
+        )
+    }
 
     func updating(validation: GitHubAccessValidation) -> GitHubCredential {
         GitHubCredential(
@@ -149,9 +197,20 @@ struct GitHubCredential: Codable, Equatable {
             userLogin: userLogin,
             authorizedOwners: validation.authorizedOwners,
             accessibleRepositories: validation.accessibleRepositories,
+            organizationOwners: validation.organizationOwners,
             lastValidatedAt: Date()
         )
     }
+}
+
+/// A device-code exchange has succeeded, but the first profile/installation
+/// lookup has not. This is intentionally a distinct Keychain record so it can
+/// never be presented as an authenticated user session.
+struct PendingGitHubDeviceCredential: Codable, Equatable {
+    let accessToken: String
+    let refreshToken: String?
+    let accessTokenExpiresAt: Date?
+    let refreshTokenExpiresAt: Date?
 }
 
 struct GitHubSessionSummary: Equatable {
@@ -160,6 +219,23 @@ struct GitHubSessionSummary: Equatable {
     let refreshTokenExpiresAt: Date?
     let authorizedOwners: [String]
     let accessibleRepositories: [String]
+    let organizationOwners: [String]
+
+    init(
+        user: GitHubUser,
+        tokenExpiresAt: Date?,
+        refreshTokenExpiresAt: Date?,
+        authorizedOwners: [String],
+        accessibleRepositories: [String],
+        organizationOwners: [String] = []
+    ) {
+        self.user = user
+        self.tokenExpiresAt = tokenExpiresAt
+        self.refreshTokenExpiresAt = refreshTokenExpiresAt
+        self.authorizedOwners = authorizedOwners
+        self.accessibleRepositories = accessibleRepositories
+        self.organizationOwners = organizationOwners
+    }
 }
 
 enum GitHubAuthenticationState: Equatable {
@@ -207,6 +283,7 @@ struct GitHubAccessValidation: Equatable {
     let accessibleRepositories: [String]
     let missingOwners: [String]
     let missingRepositories: [String]
+    let organizationOwners: [String]
 }
 
 enum GitHubAuthPollingResult: Equatable {
@@ -326,6 +403,7 @@ actor GitHubAuthProvider {
 
     private struct InstallationAccount: Decodable {
         let login: String
+        let type: String?
     }
 
     private struct InstallationRepositoriesResponse: Decodable {
@@ -348,6 +426,10 @@ actor GitHubAuthProvider {
     private var configuration: GitHubAuthConfiguration
     private var configurationGeneration: UInt = 0
     private var pendingAuthorization: GitHubDeviceAuthorization?
+    private var refreshTask: Task<GitHubCredential, Error>?
+    private var refreshTaskGeneration: UInt?
+    private var refreshTaskNonce: UInt?
+    private var nextRefreshTaskNonce: UInt = 0
 
     init(
         configuration: GitHubAuthConfiguration = .load(),
@@ -361,10 +443,17 @@ actor GitHubAuthProvider {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         self.decoder = decoder
+
+        // PATs are no longer supported. Retry this idempotent cleanup on every
+        // launch until Keychain accepts it (for example after the device unlocks).
+        try? tokenStore.deleteLegacyPersonalAccessToken()
     }
 
     func currentCredential() throws -> GitHubCredential? {
-        try tokenStore.loadCredential()
+        if try tokenStore.loadPendingDeviceCredential() != nil {
+            return nil
+        }
+        return try tokenStore.loadCredential()
     }
 
     func updateConfiguration(_ configuration: GitHubAuthConfiguration) {
@@ -373,16 +462,27 @@ actor GitHubAuthProvider {
         }
 
         configurationGeneration &+= 1
+        refreshTask?.cancel()
+        refreshTask = nil
+        refreshTaskGeneration = nil
+        refreshTaskNonce = nil
         if isDifferentAppIdentity(configuration, self.configuration) {
             pendingAuthorization = nil
+            try? tokenStore.deletePendingDeviceCredential()
         }
         self.configuration = configuration
     }
 
     func replaceConfigurationAndSignOut(_ configuration: GitHubAuthConfiguration) throws {
         configurationGeneration &+= 1
+        refreshTask?.cancel()
+        refreshTask = nil
+        refreshTaskGeneration = nil
+        refreshTaskNonce = nil
         pendingAuthorization = nil
         try tokenStore.deleteCredential()
+        try tokenStore.deletePendingDeviceCredential()
+        try tokenStore.deleteLegacyPersonalAccessToken()
         self.configuration = configuration
     }
 
@@ -473,42 +573,42 @@ actor GitHubAuthProvider {
             throw GitHubAuthError.invalidResponse("GitHub did not return an access token.")
         }
 
-        let user = try await fetchCurrentUser(token: accessToken)
-        try ensureCurrent(context)
-        var credential = GitHubCredential(
+        let pendingCredential = PendingGitHubDeviceCredential(
             accessToken: accessToken,
             refreshToken: response.refreshToken,
             accessTokenExpiresAt: response.expiresIn.map { Date().addingTimeInterval(TimeInterval($0)) },
-            refreshTokenExpiresAt: response.refreshTokenExpiresIn.map { Date().addingTimeInterval(TimeInterval($0)) },
-            userID: user.id,
-            userLogin: user.login,
-            authorizedOwners: [],
-            accessibleRepositories: [],
-            lastValidatedAt: nil
+            refreshTokenExpiresAt: response.refreshTokenExpiresIn.map { Date().addingTimeInterval(TimeInterval($0)) }
         )
-
-        do {
-            let validation = try await fetchAccessValidation(
-                token: accessToken,
-                expectedScopes: expectedScopes,
-                configuration: configuration
-            )
-            credential = credential.updating(validation: validation)
-            try ensureCurrent(context)
-            try tokenStore.saveCredential(credential)
-            pendingAuthorization = nil
-            return .completed(credential)
-        } catch let error as GitHubAuthError {
-            try ensureCurrent(context)
-            try tokenStore.saveCredential(credential)
-            pendingAuthorization = nil
-            throw error
-        }
+        try tokenStore.savePendingDeviceCredential(pendingCredential)
+        pendingAuthorization = nil
+        let credential = try await resolvePendingDeviceCredential(
+            pendingCredential,
+            expectedScopes: expectedScopes,
+            configuration: configuration,
+            context: context
+        )
+        return .completed(credential)
     }
 
     func refreshIfNeeded(expectedScopes: [RepositoryScope]) async throws -> GitHubCredential {
         let context = try configuredContext()
         let configuration = context.configuration
+
+        if let pendingCredential = try tokenStore.loadPendingDeviceCredential() {
+            do {
+                return try await resolvePendingDeviceCredential(
+                    pendingCredential,
+                    expectedScopes: expectedScopes,
+                    configuration: configuration,
+                    context: context
+                )
+            } catch let error as GitHubAuthError where isTerminalPendingDeviceCredentialError(error) {
+                // A newly issued token can still be revoked before its first
+                // profile lookup. Do not let that stale pending record shadow a
+                // usable previous session forever.
+                try tokenStore.deletePendingDeviceCredential()
+            }
+        }
 
         guard let credential = try tokenStore.loadCredential() else {
             throw GitHubAuthError.signedOut
@@ -534,6 +634,19 @@ actor GitHubAuthProvider {
     func forceRefresh(expectedScopes: [RepositoryScope]) async throws -> GitHubCredential {
         let context = try configuredContext()
         let configuration = context.configuration
+
+        if let pendingCredential = try tokenStore.loadPendingDeviceCredential() {
+            do {
+                return try await resolvePendingDeviceCredential(
+                    pendingCredential,
+                    expectedScopes: expectedScopes,
+                    configuration: configuration,
+                    context: context
+                )
+            } catch let error as GitHubAuthError where isTerminalPendingDeviceCredentialError(error) {
+                try tokenStore.deletePendingDeviceCredential()
+            }
+        }
 
         guard let credential = try tokenStore.loadCredential() else {
             throw GitHubAuthError.signedOut
@@ -570,22 +683,75 @@ actor GitHubAuthProvider {
             tokenExpiresAt: updatedCredential.accessTokenExpiresAt,
             refreshTokenExpiresAt: updatedCredential.refreshTokenExpiresAt,
             authorizedOwners: updatedCredential.authorizedOwners,
-            accessibleRepositories: updatedCredential.accessibleRepositories
+            accessibleRepositories: updatedCredential.accessibleRepositories,
+            organizationOwners: validation.organizationOwners
         )
     }
 
     func signOut() throws {
         configurationGeneration &+= 1
+        refreshTask?.cancel()
+        refreshTask = nil
+        refreshTaskGeneration = nil
+        refreshTaskNonce = nil
         pendingAuthorization = nil
         try tokenStore.deleteCredential()
+        try tokenStore.deletePendingDeviceCredential()
+        try tokenStore.deleteLegacyPersonalAccessToken()
     }
 
     func cancelPendingAuthorization() {
         configurationGeneration &+= 1
+        refreshTask?.cancel()
+        refreshTask = nil
+        refreshTaskGeneration = nil
+        refreshTaskNonce = nil
         pendingAuthorization = nil
+        try? tokenStore.deletePendingDeviceCredential()
     }
 
     private func refreshCredential(
+        _ credential: GitHubCredential,
+        expectedScopes: [RepositoryScope],
+        configuration: GitHubAuthConfiguration,
+        context: AuthenticationContext
+    ) async throws -> GitHubCredential {
+        if let refreshTask, refreshTaskGeneration == context.generation {
+            return try await refreshTask.value
+        }
+
+        let task = Task { [self] in
+            try await performRefreshCredential(
+                credential,
+                expectedScopes: expectedScopes,
+                configuration: configuration,
+                context: context
+            )
+        }
+        refreshTask = task
+        refreshTaskGeneration = context.generation
+        nextRefreshTaskNonce &+= 1
+        let taskNonce = nextRefreshTaskNonce
+        refreshTaskNonce = taskNonce
+        do {
+            let refreshedCredential = try await task.value
+            if refreshTaskGeneration == context.generation, refreshTaskNonce == taskNonce {
+                refreshTask = nil
+                refreshTaskGeneration = nil
+                refreshTaskNonce = nil
+            }
+            return refreshedCredential
+        } catch {
+            if refreshTaskGeneration == context.generation, refreshTaskNonce == taskNonce {
+                refreshTask = nil
+                refreshTaskGeneration = nil
+                refreshTaskNonce = nil
+            }
+            throw error
+        }
+    }
+
+    private func performRefreshCredential(
         _ credential: GitHubCredential,
         expectedScopes: [RepositoryScope],
         configuration: GitHubAuthConfiguration,
@@ -636,6 +802,7 @@ actor GitHubAuthProvider {
             userLogin: credential.userLogin,
             authorizedOwners: credential.authorizedOwners,
             accessibleRepositories: credential.accessibleRepositories,
+            organizationOwners: credential.organizationOwners,
             lastValidatedAt: credential.lastValidatedAt
         )
         try tokenStore.saveCredential(updatedCredential)
@@ -651,6 +818,7 @@ actor GitHubAuthProvider {
             userLogin: user.login,
             authorizedOwners: updatedCredential.authorizedOwners,
             accessibleRepositories: updatedCredential.accessibleRepositories,
+            organizationOwners: updatedCredential.organizationOwners,
             lastValidatedAt: updatedCredential.lastValidatedAt
         )
 
@@ -669,6 +837,52 @@ actor GitHubAuthProvider {
             try tokenStore.saveCredential(updatedCredential)
             throw error
         }
+    }
+
+    private func resolvePendingDeviceCredential(
+        _ pendingCredential: PendingGitHubDeviceCredential,
+        expectedScopes: [RepositoryScope],
+        configuration: GitHubAuthConfiguration,
+        context: AuthenticationContext
+    ) async throws -> GitHubCredential {
+        let user = try await fetchCurrentUser(token: pendingCredential.accessToken)
+        try ensureCurrent(context)
+        var credential = GitHubCredential(
+            accessToken: pendingCredential.accessToken,
+            refreshToken: pendingCredential.refreshToken,
+            accessTokenExpiresAt: pendingCredential.accessTokenExpiresAt,
+            refreshTokenExpiresAt: pendingCredential.refreshTokenExpiresAt,
+            userID: user.id,
+            userLogin: user.login,
+            authorizedOwners: [],
+            accessibleRepositories: [],
+            organizationOwners: [],
+            lastValidatedAt: nil
+        )
+
+        do {
+            let validation = try await fetchAccessValidation(
+                token: credential.accessToken,
+                expectedScopes: expectedScopes,
+                configuration: configuration
+            )
+            credential = credential.updating(validation: validation)
+            try ensureCurrent(context)
+            try tokenStore.saveCredential(credential)
+            try tokenStore.deletePendingDeviceCredential()
+            return credential
+        } catch let error as GitHubAuthError {
+            // The durable pending record allows a later auth check to resume a
+            // transient profile/installation failure without consuming a new code.
+            throw error
+        }
+    }
+
+    private func isTerminalPendingDeviceCredentialError(_ error: GitHubAuthError) -> Bool {
+        if case .refreshFailed = error {
+            return true
+        }
+        return false
     }
 
     private func fetchCurrentUser(token: String) async throws -> UserResponse {
@@ -698,6 +912,8 @@ actor GitHubAuthProvider {
                     switch scope {
                     case let .org(org):
                         return org.lowercased()
+                    case let .user(user):
+                        return user.lowercased()
                     case let .repo(repo):
                         return repo.split(separator: "/", maxSplits: 1).first.map(String.init)?.lowercased() ?? ""
                     }
@@ -705,6 +921,14 @@ actor GitHubAuthProvider {
         )
 
         let authorizedOwners = Set(installations.map { $0.account.login.lowercased() })
+        let organizationOwners = Set(
+            installations.compactMap { installation -> String? in
+                guard installation.account.type?.caseInsensitiveCompare("Organization") == .orderedSame else {
+                    return nil
+                }
+                return installation.account.login.lowercased()
+            }
+        )
         var accessibleRepositories = Set<String>()
         var archivedRepositories = Set<String>()
 
@@ -753,7 +977,8 @@ actor GitHubAuthProvider {
             authorizedOwners: Array(authorizedOwners).sorted(),
             accessibleRepositories: Array(accessibleRepositories).sorted(),
             missingOwners: missingOwners,
-            missingRepositories: missingRepositories
+            missingRepositories: missingRepositories,
+            organizationOwners: Array(organizationOwners).sorted()
         )
     }
 

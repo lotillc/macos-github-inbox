@@ -82,6 +82,7 @@ enum PullRequestSortOption: String, CaseIterable, Identifiable {
 
 enum RepositoryScope: Hashable, Identifiable {
     case org(String)
+    case user(String)
     case repo(String)
 
     var id: String {
@@ -92,6 +93,8 @@ enum RepositoryScope: Hashable, Identifiable {
         switch self {
         case let .org(org):
             "org:\(org)"
+        case let .user(user):
+            "user:\(user)"
         case let .repo(repo):
             "repo:\(repo)"
         }
@@ -101,6 +104,8 @@ enum RepositoryScope: Hashable, Identifiable {
         switch self {
         case let .org(org):
             org
+        case let .user(user):
+            user
         case let .repo(repo):
             repo
         }
@@ -112,6 +117,8 @@ extension RepositoryScope {
         switch self {
         case let .org(org):
             return org
+        case let .user(user):
+            return user
         case let .repo(repo):
             return repo.split(separator: "/", maxSplits: 1).first.map(String.init) ?? repo
         }

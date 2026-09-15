@@ -34,6 +34,13 @@ struct KeychainTokenStore {
         account: "github-app-device-flow-credential"
     )
 
+    /// The exact item used by releases before the GitHub App migration. Keep this
+    /// narrowly scoped so a migration can never remove an unrelated credential.
+    private static let legacyPersonalAccessTokenStore = KeychainTokenStore(
+        service: "com.github-pr-inbox.token",
+        account: "github-personal-access-token"
+    )
+
     let service: String
     let account: String
     let accessibility: KeychainTokenAccessibility
@@ -77,11 +84,49 @@ struct KeychainTokenStore {
         }
     }
 
+    func savePendingDeviceCredential(_ credential: PendingGitHubDeviceCredential) throws {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try save(data: try encoder.encode(credential), account: pendingDeviceCredentialAccount)
+    }
+
+    func loadPendingDeviceCredential() throws -> PendingGitHubDeviceCredential? {
+        guard let data = try loadData(account: pendingDeviceCredentialAccount) else {
+            return nil
+        }
+
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        do {
+            return try decoder.decode(PendingGitHubDeviceCredential.self, from: data)
+        } catch {
+            throw KeychainStoreError.invalidData
+        }
+    }
+
+    func deletePendingDeviceCredential() throws {
+        try deleteItem(account: pendingDeviceCredentialAccount)
+    }
+
+    /// Removes only the former PAT item. It is safe to invoke repeatedly, and is
+    /// deliberately a no-op for injected test/alternate credential stores.
+    func deleteLegacyPersonalAccessToken() throws {
+        guard service == Self.shared.service, account == Self.shared.account else {
+            return
+        }
+        try Self.legacyPersonalAccessTokenStore.deleteItem(account: Self.legacyPersonalAccessTokenStore.account)
+    }
+
     func hasCredentials() -> Bool {
         (try? loadCredential()) != nil
     }
 
-    private func save(data: Data) throws {
+    private var pendingDeviceCredentialAccount: String {
+        "\(account).pending-device-token"
+    }
+
+    private func save(data: Data, account: String? = nil) throws {
+        let query = query(account: account)
         let updatedAttributes: [String: Any] = [
             kSecValueData as String: data,
             kSecAttrAccessible as String: accessibility.securityValue,
@@ -90,12 +135,12 @@ struct KeychainTokenStore {
         // Refresh-token rotation must not delete the working token before its
         // replacement is safely committed. Update first, then create the item only
         // when this is the user's first sign-in.
-        let updateStatus = SecItemUpdate(baseQuery as CFDictionary, updatedAttributes as CFDictionary)
+        let updateStatus = SecItemUpdate(query as CFDictionary, updatedAttributes as CFDictionary)
         switch updateStatus {
         case errSecSuccess:
             return
         case errSecItemNotFound:
-            var newItem = baseQuery
+            var newItem = query
             newItem.merge(updatedAttributes) { _, replacement in replacement }
 
             let addStatus = SecItemAdd(newItem as CFDictionary, nil)
@@ -107,8 +152,8 @@ struct KeychainTokenStore {
         }
     }
 
-    private func loadData() throws -> Data? {
-        var query = baseQuery
+    private func loadData(account: String? = nil) throws -> Data? {
+        var query = query(account: account)
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
 
@@ -131,11 +176,20 @@ struct KeychainTokenStore {
         return data
     }
 
-    private var baseQuery: [String: Any] {
+    private func deleteItem(account: String) throws {
+        let status = SecItemDelete(query(account: account) as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw KeychainStoreError.unexpectedStatus(status)
+        }
+    }
+
+    private var baseQuery: [String: Any] { query(account: nil) }
+
+    private func query(account: String?) -> [String: Any] {
         [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
+            kSecAttrAccount as String: account ?? self.account,
         ]
     }
 }

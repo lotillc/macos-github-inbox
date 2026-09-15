@@ -303,6 +303,116 @@ struct GitHubAuthProviderTests {
     }
 
     @Test
+    func resumesPersistedDeviceTokenAfterTransientProfileFailure() async throws {
+        let store = KeychainTokenStore(
+            service: "com.github-pr-inbox.tests.\(UUID().uuidString)",
+            account: "pending-device-token"
+        )
+        defer {
+            try? store.deleteCredential()
+            try? store.deletePendingDeviceCredential()
+        }
+        try store.savePendingDeviceCredential(
+            PendingGitHubDeviceCredential(
+                accessToken: "ghu_issued",
+                refreshToken: "ghr_issued",
+                accessTokenExpiresAt: Date().addingTimeInterval(60 * 60),
+                refreshTokenExpiresAt: Date().addingTimeInterval(60 * 60 * 24)
+            )
+        )
+
+        let session = makeMockSession { request in
+            let url = try #require(request.url)
+            switch (url.host, url.path) {
+            case ("api.github.com", "/user"):
+                return jsonResponse(statusCode: 200, body: #"{ "id": 7, "login": "mona" }"#)
+            case ("api.github.com", "/user/installations"):
+                return jsonResponse(statusCode: 200, body: #"{ "installations": [] }"#)
+            default:
+                throw NSError(domain: "MockURLProtocol", code: 12)
+            }
+        }
+
+        let credential = try await testProvider(session: session, store: store)
+            .refreshIfNeeded(expectedScopes: [])
+
+        #expect(credential.accessToken == "ghu_issued")
+        #expect(try store.loadCredential()?.userLogin == "mona")
+        #expect(try store.loadPendingDeviceCredential() == nil)
+    }
+
+    @Test
+    func coalescesConcurrentRefreshesThatWouldReuseARotatingToken() async throws {
+        let store = KeychainTokenStore(
+            service: "com.github-pr-inbox.tests.\(UUID().uuidString)",
+            account: "coalesced-refresh"
+        )
+        defer { try? store.deleteCredential() }
+        var credential = testCredential()
+        credential = GitHubCredential(
+            accessToken: credential.accessToken,
+            refreshToken: credential.refreshToken,
+            accessTokenExpiresAt: Date().addingTimeInterval(-60),
+            refreshTokenExpiresAt: credential.refreshTokenExpiresAt,
+            userID: credential.userID,
+            userLogin: credential.userLogin,
+            authorizedOwners: [],
+            accessibleRepositories: [],
+            lastValidatedAt: nil
+        )
+        try store.saveCredential(credential)
+
+        let refreshStarted = DispatchSemaphore(value: 0)
+        let releaseRefresh = DispatchSemaphore(value: 0)
+        let refreshRequests = LockedRequestCounter()
+        let session = makeMockSession { request in
+            let url = try #require(request.url)
+            switch (url.host, url.path) {
+            case ("github.com", "/login/oauth/access_token"):
+                refreshRequests.increment()
+                refreshStarted.signal()
+                guard releaseRefresh.wait(timeout: .now() + 5) == .success else {
+                    throw NSError(domain: "MockURLProtocol", code: 13)
+                }
+                return jsonResponse(statusCode: 200, body: #"{ "access_token": "ghu_rotated", "refresh_token": "ghr_rotated", "expires_in": 28800 }"#)
+            case ("api.github.com", "/user"):
+                return jsonResponse(statusCode: 200, body: #"{ "id": 7, "login": "mona" }"#)
+            case ("api.github.com", "/user/installations"):
+                return jsonResponse(statusCode: 200, body: #"{ "installations": [] }"#)
+            default:
+                throw NSError(domain: "MockURLProtocol", code: 14)
+            }
+        }
+        let provider = testProvider(session: session, store: store)
+        let first = Task { try await provider.forceRefresh(expectedScopes: []) }
+        #expect(await waitForSemaphore(refreshStarted, timeout: 2) == .success)
+        let second = Task { try await provider.forceRefresh(expectedScopes: []) }
+        releaseRefresh.signal()
+
+        #expect(try await first.value.accessToken == "ghu_rotated")
+        #expect(try await second.value.accessToken == "ghu_rotated")
+        #expect(refreshRequests.value == 1)
+    }
+
+    @Test
+    func reportsClientHTTP429AsRetryableRateLimit() async throws {
+        let session = makeMockSession { _ in
+            jsonResponse(statusCode: 429, body: #"{ "message": "slow down" }"#, headers: ["Retry-After": "60"])
+        }
+        let client = GitHubClient(session: session, tokenProvider: { "ghu_test" })
+
+        do {
+            _ = try await client.validateToken()
+        } catch let error as GitHubClientError {
+            if case let .rateLimited(message) = error {
+                #expect(message.contains("60 seconds"))
+            } else {
+                Issue.record("Expected retryable rate limit, received \(error).")
+            }
+        }
+    }
+
+    @Test
     func usesUpdatedRuntimeConfigurationForDeviceAuthorization() async throws {
         let store = KeychainTokenStore(
             service: "com.github-pr-inbox.tests.\(UUID().uuidString)",
@@ -832,5 +942,18 @@ private actor RefreshTracker {
 
     func didRefresh() -> Bool {
         refreshed
+    }
+}
+
+private final class LockedRequestCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    func increment() {
+        lock.withLock { count += 1 }
+    }
+
+    var value: Int {
+        lock.withLock { count }
     }
 }

@@ -28,4 +28,11 @@ struct AllowlistParserTests {
 
         #expect(scopes == [.org("valid-org")])
     }
+
+    @Test
+    func parsesPersonalAccountScopeForSingleQueryRepositorySelection() {
+        let scopes = AllowlistParser.parseScopes(from: "user:mona\nuser:Mona")
+
+        #expect(scopes == [.user("mona")])
+    }
 }

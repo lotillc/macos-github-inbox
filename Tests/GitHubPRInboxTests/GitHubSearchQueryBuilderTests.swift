@@ -17,4 +17,14 @@ struct GitHubSearchQueryBuilderTests {
             "is:open is:pr author:@me repo:acme/backend",
         ])
     }
+
+    @Test
+    func usesUserQualifierForPersonalAccountScope() {
+        let queries = GitHubSearchQueryBuilder.buildQueries(
+            baseQualifier: "is:open is:pr",
+            scopes: [.user("mona")]
+        )
+
+        #expect(queries == ["is:open is:pr user:mona"])
+    }
 }

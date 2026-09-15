@@ -343,14 +343,26 @@ struct SettingsView: View {
             } else {
                 HStack(spacing: 10) {
                     Button("Select All Available") {
-                        for repository in model.availableRepositoryNames {
-                            setRepositoryScope(repository, selected: true)
+                        for owner in model.availableOrganizationOwners {
+                            setOrganizationScope(owner, selected: true)
+                            for repository in pickerRepositoryNames where RepositoryScope.repo(repository).ownerName.caseInsensitiveCompare(owner) == .orderedSame {
+                                setRepositoryScope(repository, selected: false)
+                            }
+                        }
+                        for owner in model.availablePersonalAccountOwners {
+                            setUserScope(owner, selected: true)
+                            for repository in pickerRepositoryNames where RepositoryScope.repo(repository).ownerName.caseInsensitiveCompare(owner) == .orderedSame {
+                                setRepositoryScope(repository, selected: false)
+                            }
                         }
                     }
 
                     Button("Clear Repository Selections") {
                         watchScopeDraft = Set(watchScopeDraft.filter { scope in
                             if case .org = scope {
+                                return true
+                            }
+                            if case .user = scope {
                                 return true
                             }
                             return false
@@ -404,25 +416,27 @@ struct SettingsView: View {
                         RepositoryScope.repo($0).ownerName.caseInsensitiveCompare(owner) == .orderedSame
                     }
                     VStack(alignment: .leading, spacing: 6) {
-                        Toggle(
-                            "Watch all repositories in \(owner)",
+                        if isOrganizationOwner(owner) || isPersonalAccountOwner(owner) {
+                            Toggle(
+                                "Watch all repositories in \(owner)",
                             isOn: Binding(
-                                get: { hasOrganizationScope(owner) },
-                                set: { isWatchingAll in
-                                    if isWatchingAll {
-                                        setOrganizationScope(owner, selected: true)
-                                        for repository in repositories {
-                                            setRepositoryScope(repository, selected: false)
+                                    get: { hasOwnerScope(owner) },
+                                    set: { isWatchingAll in
+                                        if isWatchingAll {
+                                            setOwnerScope(owner, selected: true)
+                                            for repository in repositories {
+                                                setRepositoryScope(repository, selected: false)
+                                            }
+                                        } else {
+                                            setOwnerScope(owner, selected: false)
                                         }
-                                    } else {
-                                        setOrganizationScope(owner, selected: false)
                                     }
-                                }
+                                )
                             )
-                        )
-                        .font(.subheadline.weight(.semibold))
+                            .font(.subheadline.weight(.semibold))
+                        }
 
-                        if hasOrganizationScope(owner) {
+                        if hasOwnerScope(owner) {
                             Text("GitHub will limit results to repositories this user token can access.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
@@ -475,6 +489,18 @@ struct SettingsView: View {
         }
     }
 
+    private func isOrganizationOwner(_ owner: String) -> Bool {
+        model.availableOrganizationOwners.contains {
+            $0.caseInsensitiveCompare(owner) == .orderedSame
+        }
+    }
+
+    private func isPersonalAccountOwner(_ owner: String) -> Bool {
+        model.availablePersonalAccountOwners.contains {
+            $0.caseInsensitiveCompare(owner) == .orderedSame
+        }
+    }
+
     private func canonicalNames(_ names: [String]) -> [String] {
         var canonicalNamesByIdentifier = [String: String]()
         for name in names where !name.isEmpty {
@@ -515,6 +541,19 @@ struct SettingsView: View {
         }
     }
 
+    private func hasUserScope(_ user: String) -> Bool {
+        watchScopeDraft.contains { scope in
+            guard case let .user(selectedUser) = scope else {
+                return false
+            }
+            return selectedUser.caseInsensitiveCompare(user) == .orderedSame
+        }
+    }
+
+    private func hasOwnerScope(_ owner: String) -> Bool {
+        isOrganizationOwner(owner) ? hasOrganizationScope(owner) : hasUserScope(owner)
+    }
+
     private func setOrganizationScope(_ organization: String, selected: Bool) {
         watchScopeDraft = Set(watchScopeDraft.filter { scope in
             guard case let .org(selectedOrganization) = scope else {
@@ -524,6 +563,26 @@ struct SettingsView: View {
         })
         if selected {
             watchScopeDraft.insert(.org(organization))
+        }
+    }
+
+    private func setUserScope(_ user: String, selected: Bool) {
+        watchScopeDraft = Set(watchScopeDraft.filter { scope in
+            guard case let .user(selectedUser) = scope else {
+                return true
+            }
+            return selectedUser.caseInsensitiveCompare(user) != .orderedSame
+        })
+        if selected {
+            watchScopeDraft.insert(.user(user))
+        }
+    }
+
+    private func setOwnerScope(_ owner: String, selected: Bool) {
+        if isOrganizationOwner(owner) {
+            setOrganizationScope(owner, selected: selected)
+        } else {
+            setUserScope(owner, selected: selected)
         }
     }
 
