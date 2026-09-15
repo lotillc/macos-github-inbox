@@ -1084,10 +1084,18 @@ actor GitHubAuthProvider {
         var archivedRepositories = Set<String>()
 
         for installation in installations {
-            let repositories = try await fetchRepositories(
-                forInstallationID: installation.id,
-                token: token
-            )
+            let repositories: [AccessibleRepository]
+            do {
+                repositories = try await fetchRepositories(
+                    forInstallationID: installation.id,
+                    token: token
+                )
+            } catch let error as GitHubAuthError {
+                if case let .ssoRequired(_, message) = error {
+                    throw GitHubAuthError.ssoRequired([installation.account.login], message)
+                }
+                throw error
+            }
             accessibleRepositories.formUnion(
                 repositories
                     .filter { $0.archived != true }

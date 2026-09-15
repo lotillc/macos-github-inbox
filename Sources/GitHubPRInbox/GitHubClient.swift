@@ -931,7 +931,7 @@ actor GitHubClient {
                 return .unauthorized("Your GitHub authorization needs SSO for one or more selected repositories.")
             }
 
-            return .unauthorized(message.isEmpty ? "GitHub denied access to one or more selected repositories." : message)
+            return .configuration(message.isEmpty ? "GitHub denied access to one or more selected repositories." : message)
         default:
             return .invalidResponse("GitHub API error \(statusCode): \(message)")
         }

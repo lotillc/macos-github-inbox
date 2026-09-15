@@ -44,6 +44,7 @@ final class InboxViewModel: ObservableObject {
     private var connectionGeneration: UInt = 0
 
     private static let maximumWorkflowRepositoryRequests = 100
+    private static let validationCacheLifetime: TimeInterval = 5 * 60
 
     private let authoredQualifier = "is:open is:pr archived:false author:@me"
     private let reviewQualifier = "is:open is:pr archived:false review-requested:@me"
@@ -309,6 +310,15 @@ final class InboxViewModel: ObservableObject {
                     continue
                 }
 
+                if case let GitHubAuthError.archivedRepositories(repositories) = error {
+                    signInTask = nil
+                    removeArchivedWatchRepositories(repositories)
+                    authStatusMessage = error.localizedDescription
+                    await refreshAuthStatus(forceValidation: true)
+                    await refresh()
+                    return
+                }
+
                 signInTask = nil
                 mapAuthError(error)
                 return
@@ -341,7 +351,7 @@ final class InboxViewModel: ObservableObject {
         }
     }
 
-    func refreshAuthStatus() async {
+    func refreshAuthStatus(forceValidation: Bool = false) async {
         let generation = connectionGeneration
         settings.reloadCredentialPresence()
 
@@ -403,6 +413,17 @@ final class InboxViewModel: ObservableObject {
             }
 
             if settings.scopes.isEmpty && configuration.expectedOwners.isEmpty {
+                setAuthenticatedSession(credentialSummary)
+                return
+            }
+
+            if !forceValidation,
+               canUseCachedValidation(
+                   credential,
+                   expectedScopes: settings.scopes,
+                   configuration: configuration
+               )
+            {
                 setAuthenticatedSession(credentialSummary)
                 return
             }
@@ -920,6 +941,38 @@ final class InboxViewModel: ObservableObject {
         }
     }
 
+    private func canUseCachedValidation(
+        _ credential: GitHubCredential,
+        expectedScopes: [RepositoryScope],
+        configuration: GitHubAuthConfiguration
+    ) -> Bool {
+        guard let lastValidatedAt = credential.lastValidatedAt,
+              Date().timeIntervalSince(lastValidatedAt) < Self.validationCacheLifetime
+        else {
+            return false
+        }
+
+        let expectedOwners = Set(
+            configuration.expectedOwners.map { $0.lowercased() }
+                + expectedScopes.compactMap { scope -> String? in
+                    switch scope {
+                    case let .org(owner), let .user(owner):
+                        return owner.lowercased()
+                    case let .repo(repository):
+                        return repository.split(separator: "/", maxSplits: 1).first.map(String.init)?.lowercased()
+                    }
+                }
+        )
+        let expectedRepositories = Set(expectedScopes.compactMap { scope -> String? in
+            guard case let .repo(repository) = scope else {
+                return nil
+            }
+            return repository.lowercased()
+        })
+        return expectedOwners.isSubset(of: Set(credential.authorizedOwners.map { $0.lowercased() }))
+            && expectedRepositories.isSubset(of: Set(credential.accessibleRepositories.map { $0.lowercased() }))
+    }
+
     private func shouldPreserveCachedInbox(for error: Error) -> Bool {
         guard lastKnownSessionSummary != nil else {
             return false
@@ -928,6 +981,7 @@ final class InboxViewModel: ObservableObject {
         switch error {
         case .rateLimited as GitHubClientError,
              .network as GitHubClientError,
+             .configuration as GitHubClientError,
              .rateLimited as GitHubAuthError,
              .network as GitHubAuthError:
             return true
@@ -942,6 +996,7 @@ final class InboxViewModel: ObservableObject {
              .rateLimited as GitHubAuthError:
             mapRefreshError(error)
         case .network as GitHubClientError,
+             .configuration as GitHubClientError,
              .network as GitHubAuthError:
             authStatusMessage = error.localizedDescription
         default:

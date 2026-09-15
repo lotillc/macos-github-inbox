@@ -222,7 +222,7 @@ struct SettingsView: View {
 
                     Button("Refresh Auth Status") {
                         Task {
-                            await model.refreshAuthStatus()
+                            await model.refreshAuthStatus(forceValidation: true)
                         }
                     }
 
@@ -258,7 +258,7 @@ struct SettingsView: View {
                 HStack(spacing: 10) {
                     Button("Retry Auth Check") {
                         Task {
-                            await model.refreshAuthStatus()
+                            await model.refreshAuthStatus(forceValidation: true)
                         }
                     }
 
@@ -306,7 +306,7 @@ struct SettingsView: View {
 
                     Button("Retry Auth Check") {
                         Task {
-                            await model.refreshAuthStatus()
+                            await model.refreshAuthStatus(forceValidation: true)
                         }
                     }
 
@@ -388,7 +388,7 @@ struct SettingsView: View {
 
                 Button("Refresh Repositories") {
                     Task {
-                        await model.refreshAuthStatus()
+                        await model.refreshAuthStatus(forceValidation: true)
                     }
                 }
                 .disabled(!settings.hasStoredCredentials)
@@ -399,7 +399,7 @@ struct SettingsView: View {
                         .sorted()
                         .joined(separator: "\n")
                     Task {
-                        await model.refreshAuthStatus()
+                        await model.refreshAuthStatus(forceValidation: true)
                         await model.refresh()
                     }
                 }
