@@ -3,6 +3,23 @@ import Dispatch
 import Testing
 @testable import GitHubPRInbox
 
+private final class LockedSettingsTestInt: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Int
+
+    init(_ value: Int) {
+        self.value = value
+    }
+
+    func load() -> Int {
+        lock.withLock { value }
+    }
+
+    func store(_ value: Int) {
+        lock.withLock { self.value = value }
+    }
+}
+
 @MainActor
 @Suite(.serialized)
 struct AppSettingsTests {
@@ -123,18 +140,32 @@ struct AppSettingsTests {
             configuration: settings.gitHubAppConfiguration,
             session: makeSettingsMockSession { request in
                 let url = try #require(request.url)
-                #expect((url.host, url.path) == ("api.github.com", "/user/installations"))
-                return settingsJSONResponse(
-                    statusCode: 200,
-                    body: """
-                    {
-                      "installations": [
-                        { "id": 1, "account": { "login": "acme" }, "repository_selection": "all" },
-                        { "id": 2, "account": { "login": "other-org" }, "repository_selection": "all" }
-                      ]
-                    }
-                    """
-                )
+                switch (url.host, url.path) {
+                case ("api.github.com", "/user/installations"):
+                    return settingsJSONResponse(
+                        statusCode: 200,
+                        body: """
+                        {
+                          "installations": [
+                            { "id": 1, "account": { "login": "acme" }, "repository_selection": "all" },
+                            { "id": 2, "account": { "login": "other-org" }, "repository_selection": "all" }
+                          ]
+                        }
+                        """
+                    )
+                case ("api.github.com", "/user/installations/1/repositories"):
+                    return settingsJSONResponse(
+                        statusCode: 200,
+                        body: #"{ "repositories": [{ "full_name": "acme/backend" }, { "full_name": "acme/retired", "archived": true }] }"#
+                    )
+                case ("api.github.com", "/user/installations/2/repositories"):
+                    return settingsJSONResponse(
+                        statusCode: 200,
+                        body: #"{ "repositories": [{ "full_name": "other-org/frontend" }] }"#
+                    )
+                default:
+                    throw NSError(domain: "SettingsMockURLProtocol", code: 7)
+                }
             },
             tokenStore: tokenStore
         )
@@ -160,6 +191,7 @@ struct AppSettingsTests {
         #expect(try tokenStore.loadCredential() != nil)
         #expect(settings.gitHubAppConfiguration.expectedOwners == ["other-org"])
         #expect(model.ssoAuthorizationURLs.map(\.absoluteString) == ["https://github.com/orgs/other-org/sso"])
+        #expect(model.availableRepositoryNames == ["acme/backend", "other-org/frontend"])
     }
 
     @Test
@@ -277,6 +309,175 @@ struct AppSettingsTests {
         #expect(model.reviewRequests.isEmpty)
         #expect(model.authoredPullRequests.isEmpty)
         #expect(model.workflowFailures.isEmpty)
+    }
+
+    @Test
+    func removesArchivedRepositoriesFromSavedWatchScopes() async throws {
+        let tokenStore = testTokenStore(account: "remove-archived-watch-scope")
+        defer { try? tokenStore.deleteCredential() }
+        let settings = makeSettings(
+            account: "remove-archived-watch-scope",
+            tokenStore: tokenStore,
+            configuration: GitHubAuthConfiguration(clientID: "", appSlug: "", expectedOwners: [])
+        )
+        let session = makeSettingsMockSession { request in
+            let url = try #require(request.url)
+            switch (url.host, url.path) {
+            case ("api.github.com", "/user/installations"):
+                return settingsJSONResponse(
+                    statusCode: 200,
+                    body: #"{ "installations": [{ "id": 1, "account": { "login": "acme" }, "repository_selection": "selected" }] }"#
+                )
+            case ("api.github.com", "/user/installations/1/repositories"):
+                return settingsJSONResponse(
+                    statusCode: 200,
+                    body: #"{ "repositories": [{ "full_name": "acme/backend" }, { "full_name": "acme/retired", "archived": true }] }"#
+                )
+            default:
+                throw NSError(domain: "SettingsMockURLProtocol", code: 10)
+            }
+        }
+        let provider = GitHubAuthProvider(
+            configuration: settings.gitHubAppConfiguration,
+            session: session,
+            tokenStore: tokenStore
+        )
+        let model = InboxViewModel(settings: settings, authProvider: provider)
+        guard await waitForMissingConfiguration(in: model, timeout: 2) else {
+            Issue.record("The initial refresh did not finish with the intentionally missing configuration.")
+            return
+        }
+
+        _ = try settings.saveGitHubAppConfiguration(
+            clientID: "Iv1.test",
+            appSlug: "test-app",
+            expectedOwner: ""
+        )
+        try tokenStore.saveCredential(testCredential())
+        settings.allowlistText = "acme/backend\nacme/retired"
+
+        await model.refreshAuthStatus()
+
+        #expect(settings.scopes == [.repo("acme/backend")])
+        #expect(model.authState.isAuthenticated)
+        #expect(model.authStatusMessage?.contains("Stopped watching archived repositories") == true)
+    }
+
+    @Test
+    func preservesCachedRepositoryInventoryWhenColdStartIsRateLimited() async throws {
+        let tokenStore = testTokenStore(account: "cold-start-rate-limit")
+        defer { try? tokenStore.deleteCredential() }
+        let settings = makeSettings(
+            account: "cold-start-rate-limit",
+            tokenStore: tokenStore,
+            configuration: GitHubAuthConfiguration(clientID: "", appSlug: "", expectedOwners: [])
+        )
+        let session = makeSettingsMockSession { request in
+            let url = try #require(request.url)
+            guard (url.host, url.path) == ("api.github.com", "/user/installations") else {
+                throw NSError(domain: "SettingsMockURLProtocol", code: 11)
+            }
+            return settingsJSONResponse(
+                statusCode: 429,
+                body: #"{ "message": "API rate limit exceeded" }"#
+            )
+        }
+        let provider = GitHubAuthProvider(
+            configuration: settings.gitHubAppConfiguration,
+            session: session,
+            tokenStore: tokenStore
+        )
+        let model = InboxViewModel(settings: settings, authProvider: provider)
+        guard await waitForMissingConfiguration(in: model, timeout: 2) else {
+            Issue.record("The initial refresh did not finish with the intentionally missing configuration.")
+            return
+        }
+
+        _ = try settings.saveGitHubAppConfiguration(
+            clientID: "Iv1.test",
+            appSlug: "test-app",
+            expectedOwner: ""
+        )
+        try tokenStore.saveCredential(
+            GitHubCredential(
+                accessToken: "ghu_test",
+                refreshToken: "ghr_test",
+                accessTokenExpiresAt: Date().addingTimeInterval(60 * 60),
+                refreshTokenExpiresAt: Date().addingTimeInterval(60 * 60 * 24),
+                userID: 7,
+                userLogin: "mona",
+                authorizedOwners: ["acme"],
+                accessibleRepositories: ["acme/backend"],
+                lastValidatedAt: nil
+            )
+        )
+        settings.allowlistText = "acme/backend"
+
+        await model.refreshAuthStatus()
+
+        if case .rateLimited = model.authState {
+            // Expected: no network validation was possible, but cached inventory remains usable.
+        } else {
+            Issue.record("Expected a rate-limited authentication state.")
+        }
+        #expect(model.availableRepositoryNames == ["acme/backend"])
+        #expect(model.availableRepositoryOwners == ["acme"])
+    }
+
+    @Test
+    func archivedRepositoryRemovalPublishesOnlyTheCurrentCleanup() async throws {
+        let tokenStore = testTokenStore(account: "sequential-archived-watch-scope")
+        defer { try? tokenStore.deleteCredential() }
+        let settings = makeSettings(
+            account: "sequential-archived-watch-scope",
+            tokenStore: tokenStore,
+            configuration: GitHubAuthConfiguration(clientID: "", appSlug: "", expectedOwners: [])
+        )
+        let cleanupPhase = LockedSettingsTestInt(1)
+        let session = makeSettingsMockSession { request in
+            let url = try #require(request.url)
+            switch (url.host, url.path) {
+            case ("api.github.com", "/user/installations"):
+                return settingsJSONResponse(
+                    statusCode: 200,
+                    body: #"{ "installations": [{ "id": 1, "account": { "login": "acme" }, "repository_selection": "selected" }] }"#
+                )
+            case ("api.github.com", "/user/installations/1/repositories"):
+                let repositories = cleanupPhase.load() == 1
+                    ? #"[{ "full_name": "acme/backend" }, { "full_name": "acme/retired", "archived": true }]"#
+                    : #"[{ "full_name": "acme/backend" }, { "full_name": "acme/retired" }, { "full_name": "acme/obsolete", "archived": true }]"#
+                return settingsJSONResponse(statusCode: 200, body: "{ \"repositories\": \(repositories) }")
+            default:
+                throw NSError(domain: "SettingsMockURLProtocol", code: 12)
+            }
+        }
+        let provider = GitHubAuthProvider(
+            configuration: settings.gitHubAppConfiguration,
+            session: session,
+            tokenStore: tokenStore
+        )
+        let model = InboxViewModel(settings: settings, authProvider: provider)
+        guard await waitForMissingConfiguration(in: model, timeout: 2) else {
+            Issue.record("The initial refresh did not finish with the intentionally missing configuration.")
+            return
+        }
+
+        _ = try settings.saveGitHubAppConfiguration(
+            clientID: "Iv1.test",
+            appSlug: "test-app",
+            expectedOwner: ""
+        )
+        try tokenStore.saveCredential(testCredential())
+        settings.allowlistText = "acme/backend\nacme/retired"
+
+        await model.refreshAuthStatus()
+        #expect(settings.scopes == [.repo("acme/backend")])
+        cleanupPhase.store(2)
+        settings.allowlistText = "acme/backend\nacme/retired\nacme/obsolete"
+        await model.refreshAuthStatus()
+
+        #expect(settings.scopes == [.repo("acme/backend"), .repo("acme/retired")])
+        #expect(model.removedArchivedRepositoryNames == ["acme/obsolete"])
     }
 
     @Test

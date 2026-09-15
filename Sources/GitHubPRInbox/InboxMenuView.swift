@@ -222,6 +222,7 @@ struct InboxMenuView: View {
                 Text("Finish GitHub sign-in in Settings.")
                     .foregroundStyle(.secondary)
             case let .refreshFailed(message),
+                 let .rateLimited(message),
                  let .ssoRequired(_, message),
                  let .installationMissing(_, message):
                 Text(message)

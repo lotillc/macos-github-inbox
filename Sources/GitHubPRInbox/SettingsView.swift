@@ -1,3 +1,4 @@
+import Combine
 import SwiftUI
 
 @MainActor
@@ -6,7 +7,7 @@ struct SettingsView: View {
     @ObservedObject var settings: AppSettings
     @ObservedObject var launchAtLoginManager: LaunchAtLoginManager
 
-    @State private var allowlistDraft = ""
+    @State private var watchScopeDraft = Set<RepositoryScope>()
     @State private var trackedWorkflowsDraft = ""
     @State private var gitHubAppClientIDDraft = ""
     @State private var gitHubAppSlugDraft = ""
@@ -30,13 +31,26 @@ struct SettingsView: View {
             .padding(24)
         }
         .background(Color(nsColor: .windowBackgroundColor))
-        .frame(minWidth: 620, minHeight: 650)
+        .frame(minWidth: 620, minHeight: 700)
         .task {
-            allowlistDraft = settings.allowlistText
+            watchScopeDraft = Set(settings.scopes)
             trackedWorkflowsDraft = settings.trackedWorkflowNamesText
             gitHubAppClientIDDraft = settings.gitHubAppClientID
             gitHubAppSlugDraft = settings.gitHubAppSlug
             gitHubAppExpectedOwnerDraft = settings.gitHubAppExpectedOwner
+        }
+        .onReceive(model.$removedArchivedRepositoryNames) { archivedRepositories in
+            guard !archivedRepositories.isEmpty else {
+                return
+            }
+
+            watchScopeDraft = Set(watchScopeDraft.filter { scope in
+                guard case let .repo(repository) = scope else {
+                    return true
+                }
+
+                return !archivedRepositories.contains(repository.lowercased())
+            })
         }
     }
 
@@ -238,6 +252,21 @@ struct SettingsView: View {
                     }
                 }
 
+            case let .rateLimited(message):
+                authMessage(message, tone: .warning)
+
+                HStack(spacing: 10) {
+                    Button("Retry Auth Check") {
+                        Task {
+                            await model.refreshAuthStatus()
+                        }
+                    }
+
+                    Button("Sign Out", role: .destructive) {
+                        model.signOut()
+                    }
+                }
+
             case let .ssoRequired(_, message):
                 authMessage(message, tone: .warning)
 
@@ -258,6 +287,10 @@ struct SettingsView: View {
                         Task {
                             await model.beginSignIn()
                         }
+                    }
+
+                    Button("Sign Out", role: .destructive) {
+                        model.signOut()
                     }
                 }
 
@@ -282,6 +315,10 @@ struct SettingsView: View {
                             await model.beginSignIn()
                         }
                     }
+
+                    Button("Sign Out", role: .destructive) {
+                        model.signOut()
+                    }
                 }
             }
 
@@ -294,32 +331,206 @@ struct SettingsView: View {
     }
 
     private var watchSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 12) {
             sectionLabel("Watch")
 
-            Text("One org or repo per line.")
+            Text("Choose repositories that are available to both your GitHub account and the installed GitHub App.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
-            editorCard(text: $allowlistDraft, minHeight: 120)
+            if pickerRepositoryNames.isEmpty && watchScopeDraft.isEmpty {
+                authMessage("Sign in, then refresh auth status to load repositories for this picker.", tone: .neutral)
+            } else {
+                HStack(spacing: 10) {
+                    Button("Select All Available") {
+                        for repository in model.availableRepositoryNames {
+                            setRepositoryScope(repository, selected: true)
+                        }
+                    }
+
+                    Button("Clear Repository Selections") {
+                        watchScopeDraft = Set(watchScopeDraft.filter { scope in
+                            if case .org = scope {
+                                return true
+                            }
+                            return false
+                        })
+                    }
+
+                    Spacer()
+
+                    Text(selectedRepositoryCount == 1 ? "1 repository selected" : "\(selectedRepositoryCount) repositories selected")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                repositoryPicker
+            }
 
             HStack {
-                let draftScopes = AllowlistParser.parseScopes(from: allowlistDraft)
-
-                Text("\(draftScopes.count) scope\(draftScopes.count == 1 ? "" : "s")")
+                Text("\(watchScopeDraft.count) watch scope\(watchScopeDraft.count == 1 ? "" : "s")")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
                 Spacer()
 
+                Button("Refresh Repositories") {
+                    Task {
+                        await model.refreshAuthStatus()
+                    }
+                }
+                .disabled(!settings.hasStoredCredentials)
+
                 Button("Apply") {
-                    settings.allowlistText = allowlistDraft
+                    settings.allowlistText = watchScopeDraft
+                        .map(\.qualifier)
+                        .sorted()
+                        .joined(separator: "\n")
                     Task {
                         await model.refreshAuthStatus()
                         await model.refresh()
                     }
                 }
-                .disabled(allowlistDraft == settings.allowlistText)
+                .disabled(watchScopeDraft == Set(settings.scopes))
+            }
+        }
+    }
+
+    private var repositoryPicker: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 10) {
+                ForEach(repositoryOwners, id: \.self) { owner in
+                    let repositories = pickerRepositoryNames.filter {
+                        RepositoryScope.repo($0).ownerName.caseInsensitiveCompare(owner) == .orderedSame
+                    }
+                    VStack(alignment: .leading, spacing: 6) {
+                        Toggle(
+                            "Watch all repositories in \(owner)",
+                            isOn: Binding(
+                                get: { hasOrganizationScope(owner) },
+                                set: { isWatchingAll in
+                                    if isWatchingAll {
+                                        setOrganizationScope(owner, selected: true)
+                                        for repository in repositories {
+                                            setRepositoryScope(repository, selected: false)
+                                        }
+                                    } else {
+                                        setOrganizationScope(owner, selected: false)
+                                    }
+                                }
+                            )
+                        )
+                        .font(.subheadline.weight(.semibold))
+
+                        if hasOrganizationScope(owner) {
+                            Text("GitHub will limit results to repositories this user token can access.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            ForEach(repositories, id: \.self) { repository in
+                                Toggle(
+                                    isRepositoryAvailable(repository)
+                                        ? repository
+                                        : "\(repository) (no longer available)",
+                                    isOn: Binding(
+                                        get: { hasRepositoryScope(repository) },
+                                        set: { isSelected in
+                                            setRepositoryScope(repository, selected: isSelected)
+                                        }
+                                    )
+                                )
+                                .toggleStyle(.checkbox)
+                                .padding(.leading, 20)
+                            }
+                        }
+                    }
+                    .padding(10)
+                    .background(.quaternary.opacity(0.35))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                }
+            }
+        }
+        .frame(minHeight: 160, maxHeight: 280)
+    }
+
+    private var repositoryOwners: [String] {
+        let ownersFromRepositories = pickerRepositoryNames.map { RepositoryScope.repo($0).ownerName }
+        let ownersFromScopes = watchScopeDraft.map(\.ownerName)
+        return canonicalNames(model.availableRepositoryOwners + ownersFromRepositories + ownersFromScopes)
+    }
+
+    private var pickerRepositoryNames: [String] {
+        let selectedRepositories = watchScopeDraft.compactMap { scope -> String? in
+            guard case let .repo(repository) = scope else {
+                return nil
+            }
+            return repository
+        }
+        return canonicalNames(selectedRepositories + model.availableRepositoryNames)
+    }
+
+    private func isRepositoryAvailable(_ repository: String) -> Bool {
+        model.availableRepositoryNames.contains {
+            $0.caseInsensitiveCompare(repository) == .orderedSame
+        }
+    }
+
+    private func canonicalNames(_ names: [String]) -> [String] {
+        var canonicalNamesByIdentifier = [String: String]()
+        for name in names where !name.isEmpty {
+            canonicalNamesByIdentifier[name.lowercased()] = name
+        }
+        return canonicalNamesByIdentifier.values.sorted {
+            $0.localizedCaseInsensitiveCompare($1) == .orderedAscending
+        }
+    }
+
+    private func hasRepositoryScope(_ repository: String) -> Bool {
+        watchScopeDraft.contains { scope in
+            guard case let .repo(selectedRepository) = scope else {
+                return false
+            }
+            return selectedRepository.caseInsensitiveCompare(repository) == .orderedSame
+        }
+    }
+
+    private func setRepositoryScope(_ repository: String, selected: Bool) {
+        watchScopeDraft = Set(watchScopeDraft.filter { scope in
+            guard case let .repo(selectedRepository) = scope else {
+                return true
+            }
+            return selectedRepository.caseInsensitiveCompare(repository) != .orderedSame
+        })
+        if selected {
+            watchScopeDraft.insert(.repo(repository))
+        }
+    }
+
+    private func hasOrganizationScope(_ organization: String) -> Bool {
+        watchScopeDraft.contains { scope in
+            guard case let .org(selectedOrganization) = scope else {
+                return false
+            }
+            return selectedOrganization.caseInsensitiveCompare(organization) == .orderedSame
+        }
+    }
+
+    private func setOrganizationScope(_ organization: String, selected: Bool) {
+        watchScopeDraft = Set(watchScopeDraft.filter { scope in
+            guard case let .org(selectedOrganization) = scope else {
+                return true
+            }
+            return selectedOrganization.caseInsensitiveCompare(organization) != .orderedSame
+        })
+        if selected {
+            watchScopeDraft.insert(.org(organization))
+        }
+    }
+
+    private var selectedRepositoryCount: Int {
+        watchScopeDraft.reduce(into: 0) { count, scope in
+            if case .repo = scope {
+                count += 1
             }
         }
     }

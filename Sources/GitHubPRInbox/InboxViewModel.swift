@@ -14,6 +14,7 @@ final class InboxViewModel: ObservableObject {
     @Published private(set) var lastRefreshAt: Date?
     @Published private(set) var statusMessage: String?
     @Published private(set) var authStatusMessage: String?
+    @Published private(set) var removedArchivedRepositoryNames = Set<String>()
     @Published private(set) var ciStatusesByPullRequestID: [String: PullRequestCIStatus] = [:]
     @Published private(set) var ciDebugSummariesByPullRequestID: [String: String] = [:]
     @Published private(set) var newlyAssignedPullRequestIDs = Set<String>()
@@ -23,6 +24,7 @@ final class InboxViewModel: ObservableObject {
     private let settings: AppSettings
     private let authProvider: GitHubAuthProvider
     private let clientSession: URLSession
+    private var lastKnownSessionSummary: GitHubSessionSummary?
     private var authoredSource: [PullRequestItem] = []
     private var reviewSource: [PullRequestItem] = []
     private var workflowFailureSource: [WorkflowFailureItem] = []
@@ -97,11 +99,24 @@ final class InboxViewModel: ObservableObject {
         settings.gitHubAppConfiguration.appInstallationURL
     }
 
+    var availableRepositoryNames: [String] {
+        repositoryInventorySummary?.accessibleRepositories.sorted() ?? []
+    }
+
+    var availableRepositoryOwners: [String] {
+        repositoryInventorySummary?.authorizedOwners.sorted() ?? []
+    }
+
     func refresh() async {
         let generation = connectionGeneration
         await refreshAuthStatus()
 
         guard isCurrentConnection(generation) else {
+            return
+        }
+
+        if case .rateLimited = authState {
+            statusMessage = authState.guidanceText
             return
         }
 
@@ -197,6 +212,12 @@ final class InboxViewModel: ObservableObject {
             guard isCurrentConnection(generation) else {
                 return
             }
+            if case let GitHubAuthError.archivedRepositories(repositories) = error {
+                removeArchivedWatchRepositories(repositories)
+                authStatusMessage = error.localizedDescription
+                await refreshAuthStatus()
+                return
+            }
             mapAuthError(error)
         }
     }
@@ -269,6 +290,7 @@ final class InboxViewModel: ObservableObject {
                 }
                 settings.reloadCredentialPresence()
                 currentUser = nil
+                lastKnownSessionSummary = nil
                 authState = .signedOut
                 authStatusMessage = "Signed out of GitHub."
                 statusMessage = "Sign in with GitHub in Settings to load pull requests."
@@ -319,17 +341,17 @@ final class InboxViewModel: ObservableObject {
             }
 
             currentUser = GitHubUser(login: credential.userLogin)
+            let credentialSummary = GitHubSessionSummary(
+                user: GitHubUser(login: credential.userLogin),
+                tokenExpiresAt: credential.accessTokenExpiresAt,
+                refreshTokenExpiresAt: credential.refreshTokenExpiresAt,
+                authorizedOwners: credential.authorizedOwners,
+                accessibleRepositories: credential.accessibleRepositories
+            )
+            lastKnownSessionSummary = credentialSummary
 
             if settings.scopes.isEmpty && configuration.expectedOwners.isEmpty {
-                authState = .signedIn(
-                    GitHubSessionSummary(
-                        user: GitHubUser(login: credential.userLogin),
-                        tokenExpiresAt: credential.accessTokenExpiresAt,
-                        refreshTokenExpiresAt: credential.refreshTokenExpiresAt,
-                        authorizedOwners: credential.authorizedOwners,
-                        accessibleRepositories: credential.accessibleRepositories
-                    )
-                )
+                setAuthenticatedSession(credentialSummary)
                 return
             }
 
@@ -338,9 +360,15 @@ final class InboxViewModel: ObservableObject {
                 return
             }
             currentUser = summary.user
-            authState = .signedIn(summary)
+            setAuthenticatedSession(summary)
         } catch {
             guard isCurrentConnection(generation) else {
+                return
+            }
+            if case let GitHubAuthError.archivedRepositories(repositories) = error {
+                removeArchivedWatchRepositories(repositories)
+                authStatusMessage = error.localizedDescription
+                await refreshAuthStatus()
                 return
             }
             mapAuthError(error)
@@ -430,6 +458,7 @@ final class InboxViewModel: ObservableObject {
 
         if appIdentityChanged {
             currentUser = nil
+            lastKnownSessionSummary = nil
             authState = .signedOut
             authStatusMessage = "GitHub App changed. Reconnect to GitHub."
             statusMessage = "Sign in with GitHub in Settings to load pull requests."
@@ -747,6 +776,38 @@ final class InboxViewModel: ObservableObject {
         applySnapshot(newItemTracking: .reset)
     }
 
+    private func removeArchivedWatchRepositories(_ repositories: [String]) {
+        let archivedRepositoryNames = Set(repositories.map { $0.lowercased() })
+        removedArchivedRepositoryNames = archivedRepositoryNames
+        let remainingScopes = settings.scopes.filter { scope in
+            guard case let .repo(repository) = scope else {
+                return true
+            }
+
+            return !archivedRepositoryNames.contains(repository.lowercased())
+        }
+        settings.allowlistText = remainingScopes
+            .map(\.qualifier)
+            .sorted()
+            .joined(separator: "\n")
+    }
+
+    private var repositoryInventorySummary: GitHubSessionSummary? {
+        switch authState {
+        case let .signedIn(summary):
+            return summary
+        case .rateLimited:
+            return lastKnownSessionSummary
+        default:
+            return nil
+        }
+    }
+
+    private func setAuthenticatedSession(_ summary: GitHubSessionSummary) {
+        lastKnownSessionSummary = summary
+        authState = .signedIn(summary)
+    }
+
     private func invalidateConnection() {
         connectionGeneration &+= 1
         isLoading = false
@@ -771,17 +832,22 @@ final class InboxViewModel: ObservableObject {
             case .signedOut, .configurationChanged:
                 authState = .signedOut
                 currentUser = nil
+                lastKnownSessionSummary = nil
             case .pendingAuthorizationRequired:
                 authState = .signedOut
             case let .authorizationDenied(message),
                  let .authorizationExpired(message),
                  let .refreshFailed(message):
                 authState = .refreshFailed(message)
+            case let .rateLimited(message):
+                authState = .rateLimited(message)
             case let .ssoRequired(owners, message):
                 authState = .ssoRequired(owners.isEmpty ? watchedOwners() : owners, message)
             case let .installationMissing(owners, repositories, message):
                 let identifiers = owners.isEmpty ? repositories : owners
                 authState = .installationMissing(identifiers, message)
+            case .archivedRepositories:
+                authState = .refreshFailed(error.localizedDescription)
             case let .invalidResponse(message),
                  let .network(message):
                 authState = .refreshFailed(message)

@@ -168,6 +168,7 @@ enum GitHubAuthenticationState: Equatable {
     case authorizing(GitHubDeviceAuthorization)
     case signedIn(GitHubSessionSummary)
     case refreshFailed(String)
+    case rateLimited(String)
     case ssoRequired([String], String)
     case installationMissing([String], String)
 
@@ -190,6 +191,8 @@ enum GitHubAuthenticationState: Equatable {
         case .signedIn:
             return ""
         case let .refreshFailed(message):
+            return message
+        case let .rateLimited(message):
             return message
         case let .ssoRequired(_, message):
             return message
@@ -219,8 +222,10 @@ enum GitHubAuthError: LocalizedError, Equatable {
     case authorizationDenied(String)
     case authorizationExpired(String)
     case refreshFailed(String)
+    case rateLimited(String)
     case ssoRequired([String], String)
     case installationMissing([String], [String], String)
+    case archivedRepositories([String])
     case invalidResponse(String)
     case network(String)
 
@@ -230,11 +235,14 @@ enum GitHubAuthError: LocalizedError, Equatable {
              let .authorizationDenied(message),
              let .authorizationExpired(message),
              let .refreshFailed(message),
+             let .rateLimited(message),
              let .ssoRequired(_, message),
              let .installationMissing(_, _, message),
              let .invalidResponse(message),
              let .network(message):
             return message
+        case let .archivedRepositories(repositories):
+            return "Stopped watching archived repositories: \(repositories.joined(separator: ", "))."
         case .signedOut:
             return "Sign in with GitHub in Settings."
         case .configurationChanged:
@@ -326,9 +334,11 @@ actor GitHubAuthProvider {
 
     private struct AccessibleRepository: Decodable {
         let fullName: String
+        let archived: Bool?
 
         enum CodingKeys: String, CodingKey {
             case fullName = "full_name"
+            case archived
         }
     }
 
@@ -615,7 +625,6 @@ actor GitHubAuthProvider {
             throw GitHubAuthError.refreshFailed("GitHub did not return a refreshed access token.")
         }
 
-        let user = try await fetchCurrentUser(token: accessToken)
         try ensureCurrent(context)
         var updatedCredential = GitHubCredential(
             accessToken: accessToken,
@@ -623,11 +632,26 @@ actor GitHubAuthProvider {
             accessTokenExpiresAt: response.expiresIn.map { Date().addingTimeInterval(TimeInterval($0)) },
             refreshTokenExpiresAt: response.refreshTokenExpiresIn.map { Date().addingTimeInterval(TimeInterval($0)) }
                 ?? credential.refreshTokenExpiresAt,
-            userID: user.id,
-            userLogin: user.login,
+            userID: credential.userID,
+            userLogin: credential.userLogin,
             authorizedOwners: credential.authorizedOwners,
             accessibleRepositories: credential.accessibleRepositories,
             lastValidatedAt: credential.lastValidatedAt
+        )
+        try tokenStore.saveCredential(updatedCredential)
+
+        let user = try await fetchCurrentUser(token: accessToken)
+        try ensureCurrent(context)
+        updatedCredential = GitHubCredential(
+            accessToken: updatedCredential.accessToken,
+            refreshToken: updatedCredential.refreshToken,
+            accessTokenExpiresAt: updatedCredential.accessTokenExpiresAt,
+            refreshTokenExpiresAt: updatedCredential.refreshTokenExpiresAt,
+            userID: user.id,
+            userLogin: user.login,
+            authorizedOwners: updatedCredential.authorizedOwners,
+            accessibleRepositories: updatedCredential.accessibleRepositories,
+            lastValidatedAt: updatedCredential.lastValidatedAt
         )
 
         do {
@@ -682,27 +706,30 @@ actor GitHubAuthProvider {
 
         let authorizedOwners = Set(installations.map { $0.account.login.lowercased() })
         var accessibleRepositories = Set<String>()
+        var archivedRepositories = Set<String>()
 
         for installation in installations {
-            let owner = installation.account.login.lowercased()
-            let ownerRepositories = explicitRepositories.filter { $0.hasPrefix("\(owner)/") }
-            guard !ownerRepositories.isEmpty else {
-                continue
-            }
-
-            if installation.repositorySelection?.lowercased() == "all" {
-                accessibleRepositories.formUnion(ownerRepositories)
-                continue
-            }
-
             let repositories = try await fetchRepositories(
                 forInstallationID: installation.id,
                 token: token
             )
-            accessibleRepositories.formUnion(repositories.map { $0.lowercased() })
+            accessibleRepositories.formUnion(
+                repositories
+                    .filter { $0.archived != true }
+                    .map { $0.fullName.lowercased() }
+            )
+            archivedRepositories.formUnion(
+                repositories
+                    .filter { $0.archived == true }
+                    .map { $0.fullName.lowercased() }
+            )
         }
 
         let missingOwners = Array(expectedOwners.subtracting(authorizedOwners)).sorted()
+        let selectedArchivedRepositories = Array(explicitRepositories.intersection(archivedRepositories)).sorted()
+        if !selectedArchivedRepositories.isEmpty {
+            throw GitHubAuthError.archivedRepositories(selectedArchivedRepositories)
+        }
         let missingRepositories = Array(explicitRepositories.subtracting(accessibleRepositories)).sorted()
 
         if !missingRepositories.isEmpty || !missingOwners.isEmpty {
@@ -759,9 +786,9 @@ actor GitHubAuthProvider {
     private func fetchRepositories(
         forInstallationID installationID: Int,
         token: String
-    ) async throws -> [String] {
+    ) async throws -> [AccessibleRepository] {
         var page = 1
-        var repositories: [String] = []
+        var repositories: [AccessibleRepository] = []
 
         while true {
             var components = URLComponents(
@@ -775,7 +802,7 @@ actor GitHubAuthProvider {
             let request = apiRequest(url: components.url!, token: token)
             let data = try await send(request)
             let response = try decode(InstallationRepositoriesResponse.self, from: data)
-            repositories.append(contentsOf: response.repositories.map(\.fullName))
+            repositories.append(contentsOf: response.repositories)
 
             if response.repositories.count < 100 {
                 break
@@ -843,7 +870,11 @@ actor GitHubAuthProvider {
             }
 
             guard (200...299).contains(httpResponse.statusCode) else {
-                throw mapHTTPError(statusCode: httpResponse.statusCode, bodyData: data)
+                throw mapHTTPError(
+                    statusCode: httpResponse.statusCode,
+                    bodyData: data,
+                    headers: httpResponse.allHeaderFields
+                )
             }
 
             return data
@@ -854,7 +885,11 @@ actor GitHubAuthProvider {
         }
     }
 
-    private func mapHTTPError(statusCode: Int, bodyData: Data) -> GitHubAuthError {
+    private func mapHTTPError(
+        statusCode: Int,
+        bodyData: Data,
+        headers: [AnyHashable: Any]
+    ) -> GitHubAuthError {
         let apiError = try? decoder.decode(APIErrorResponse.self, from: bodyData)
         let message = apiError?.message ?? String(decoding: bodyData, as: UTF8.self)
         let normalizedMessage = message.lowercased()
@@ -862,7 +897,10 @@ actor GitHubAuthProvider {
         switch statusCode {
         case 401:
             return .refreshFailed("GitHub sign-in expired. Reconnect in Settings.")
-        case 403:
+        case 403, 429:
+            if statusCode == 429 || isRateLimited(headers: headers, normalizedMessage: normalizedMessage) {
+                return .rateLimited(rateLimitMessage(headers: headers))
+            }
             if normalizedMessage.contains("saml") || normalizedMessage.contains("single sign-on") {
                 return .ssoRequired([], "Your GitHub authorization needs SSO for one or more watched owners.")
             }
@@ -871,6 +909,36 @@ actor GitHubAuthProvider {
         default:
             return .invalidResponse("GitHub API error \(statusCode): \(message)")
         }
+    }
+
+    private func isRateLimited(headers: [AnyHashable: Any], normalizedMessage: String) -> Bool {
+        if normalizedMessage.contains("rate limit") {
+            return true
+        }
+
+        return headerValue("x-ratelimit-remaining", in: headers) == "0"
+            || headerValue("retry-after", in: headers) != nil
+    }
+
+    private func rateLimitMessage(headers: [AnyHashable: Any]) -> String {
+        if let retryAfter = headerValue("retry-after", in: headers) {
+            return "GitHub rate limit reached. Try again in \(retryAfter) seconds."
+        }
+
+        guard let resetValue = headerValue("x-ratelimit-reset", in: headers),
+              let resetTimestamp = TimeInterval(resetValue)
+        else {
+            return "GitHub rate limit reached. Try again shortly."
+        }
+
+        let resetDate = Date(timeIntervalSince1970: resetTimestamp)
+        return "GitHub rate limit reached. Try again after \(resetDate.formatted(date: .omitted, time: .shortened))."
+    }
+
+    private func headerValue(_ name: String, in headers: [AnyHashable: Any]) -> String? {
+        headers.first { key, _ in
+            String(describing: key).caseInsensitiveCompare(name) == .orderedSame
+        }.map { String(describing: $0.value) }
     }
 
     private func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {

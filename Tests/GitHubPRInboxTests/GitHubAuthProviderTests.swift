@@ -249,6 +249,60 @@ struct GitHubAuthProviderTests {
     }
 
     @Test
+    func persistsRotatedCredentialWhenUserLookupAfterRefreshFails() async throws {
+        let store = KeychainTokenStore(
+            service: "com.github-pr-inbox.tests.\(UUID().uuidString)",
+            account: "refresh-persisted-before-user-lookup"
+        )
+        defer { try? store.deleteCredential() }
+        try store.saveCredential(
+            GitHubCredential(
+                accessToken: "ghu_expired",
+                refreshToken: "ghr_previous",
+                accessTokenExpiresAt: Date().addingTimeInterval(-60),
+                refreshTokenExpiresAt: Date().addingTimeInterval(60 * 60),
+                userID: 7,
+                userLogin: "mona",
+                authorizedOwners: [],
+                accessibleRepositories: [],
+                lastValidatedAt: nil
+            )
+        )
+
+        let session = makeMockSession { request in
+            let url = try #require(request.url)
+            switch (url.host, url.path) {
+            case ("github.com", "/login/oauth/access_token"):
+                return jsonResponse(
+                    statusCode: 200,
+                    body: """
+                    {
+                      "access_token": "ghu_rotated",
+                      "refresh_token": "ghr_rotated",
+                      "expires_in": 28800,
+                      "refresh_token_expires_in": 15897600,
+                      "token_type": "bearer"
+                    }
+                    """
+                )
+            case ("api.github.com", "/user"):
+                return jsonResponse(statusCode: 500, body: #"{ "message": "temporary failure" }"#)
+            default:
+                throw NSError(domain: "MockURLProtocol", code: 7)
+            }
+        }
+        let provider = testProvider(session: session, store: store)
+
+        await #expect(throws: GitHubAuthError.self) {
+            _ = try await provider.refreshIfNeeded(expectedScopes: [])
+        }
+
+        let storedCredential = try #require(try store.loadCredential())
+        #expect(storedCredential.accessToken == "ghu_rotated")
+        #expect(storedCredential.refreshToken == "ghr_rotated")
+    }
+
+    @Test
     func usesUpdatedRuntimeConfigurationForDeviceAuthorization() async throws {
         let store = KeychainTokenStore(
             service: "com.github-pr-inbox.tests.\(UUID().uuidString)",
@@ -465,6 +519,72 @@ struct GitHubAuthProviderTests {
     }
 
     @Test
+    func reportsRateLimitingSeparatelyFromMissingInstallation() async throws {
+        let store = KeychainTokenStore(
+            service: "com.github-pr-inbox.tests.\(UUID().uuidString)",
+            account: "rate-limited"
+        )
+        defer { try? store.deleteCredential() }
+        try store.saveCredential(testCredential())
+
+        let session = makeMockSession { request in
+            let url = try #require(request.url)
+            #expect((url.host, url.path) == ("api.github.com", "/user/installations"))
+            return jsonResponse(
+                statusCode: 403,
+                body: #"{ "message": "API rate limit exceeded" }"#,
+                headers: ["X-RateLimit-Remaining": "0"]
+            )
+        }
+        let provider = testProvider(session: session, store: store)
+
+        do {
+            _ = try await provider.validateOrgAccess(expectedScopes: [.org("acme")])
+            Issue.record("Expected GitHub rate limiting to be reported separately.")
+        } catch let error as GitHubAuthError {
+            switch error {
+            case let .rateLimited(message):
+                #expect(message.localizedCaseInsensitiveContains("rate limit"))
+            default:
+                Issue.record("Expected rateLimited, received \(error).")
+            }
+        }
+    }
+
+    @Test
+    func reportsHTTP429AsRateLimited() async throws {
+        let store = KeychainTokenStore(
+            service: "com.github-pr-inbox.tests.\(UUID().uuidString)",
+            account: "http-429-rate-limited"
+        )
+        defer { try? store.deleteCredential() }
+        try store.saveCredential(testCredential())
+
+        let session = makeMockSession { request in
+            let url = try #require(request.url)
+            #expect((url.host, url.path) == ("api.github.com", "/user/installations"))
+            return jsonResponse(
+                statusCode: 429,
+                body: #"{ "message": "slow down" }"#,
+                headers: ["Retry-After": "60"]
+            )
+        }
+        let provider = testProvider(session: session, store: store)
+
+        do {
+            _ = try await provider.validateOrgAccess(expectedScopes: [.org("acme")])
+            Issue.record("Expected HTTP 429 to be reported as rate limited.")
+        } catch let error as GitHubAuthError {
+            switch error {
+            case let .rateLimited(message):
+                #expect(message.contains("60 seconds"))
+            default:
+                Issue.record("Expected rateLimited, received \(error).")
+            }
+        }
+    }
+
+    @Test
     func reportsMissingSelectedRepositorySeparatelyFromSSO() async throws {
         let store = KeychainTokenStore(
             service: "com.github-pr-inbox.tests.\(UUID().uuidString)",
@@ -658,13 +778,19 @@ private func makeMockSession(
     return URLSession(configuration: configuration)
 }
 
-private func jsonResponse(statusCode: Int, body: String) -> (HTTPURLResponse, Data) {
+private func jsonResponse(
+    statusCode: Int,
+    body: String,
+    headers: [String: String] = [:]
+) -> (HTTPURLResponse, Data) {
     let url = URL(string: "https://example.com")!
+    var responseHeaders = ["Content-Type": "application/json"]
+    responseHeaders.merge(headers) { _, new in new }
     let response = HTTPURLResponse(
         url: url,
         statusCode: statusCode,
         httpVersion: nil,
-        headerFields: ["Content-Type": "application/json"]
+        headerFields: responseHeaders
     )!
     return (response, Data(body.utf8))
 }
