@@ -870,10 +870,13 @@ actor GitHubAuthProvider {
             }
 
             guard (200...299).contains(httpResponse.statusCode) else {
+                let headers = httpResponse.allHeaderFields.reduce(into: [String: String]()) { result, header in
+                    result[String(describing: header.key).lowercased()] = String(describing: header.value)
+                }
                 throw mapHTTPError(
                     statusCode: httpResponse.statusCode,
                     bodyData: data,
-                    headers: httpResponse.allHeaderFields
+                    headers: headers
                 )
             }
 
@@ -888,7 +891,7 @@ actor GitHubAuthProvider {
     private func mapHTTPError(
         statusCode: Int,
         bodyData: Data,
-        headers: [AnyHashable: Any]
+        headers: [String: String]
     ) -> GitHubAuthError {
         let apiError = try? decoder.decode(APIErrorResponse.self, from: bodyData)
         let message = apiError?.message ?? String(decoding: bodyData, as: UTF8.self)
@@ -911,7 +914,7 @@ actor GitHubAuthProvider {
         }
     }
 
-    private func isRateLimited(headers: [AnyHashable: Any], normalizedMessage: String) -> Bool {
+    private func isRateLimited(headers: [String: String], normalizedMessage: String) -> Bool {
         if normalizedMessage.contains("rate limit") {
             return true
         }
@@ -920,7 +923,7 @@ actor GitHubAuthProvider {
             || headerValue("retry-after", in: headers) != nil
     }
 
-    private func rateLimitMessage(headers: [AnyHashable: Any]) -> String {
+    private func rateLimitMessage(headers: [String: String]) -> String {
         if let retryAfter = headerValue("retry-after", in: headers) {
             return "GitHub rate limit reached. Try again in \(retryAfter) seconds."
         }
@@ -935,10 +938,8 @@ actor GitHubAuthProvider {
         return "GitHub rate limit reached. Try again after \(resetDate.formatted(date: .omitted, time: .shortened))."
     }
 
-    private func headerValue(_ name: String, in headers: [AnyHashable: Any]) -> String? {
-        headers.first { key, _ in
-            String(describing: key).caseInsensitiveCompare(name) == .orderedSame
-        }.map { String(describing: $0.value) }
+    private func headerValue(_ name: String, in headers: [String: String]) -> String? {
+        headers[name.lowercased()]
     }
 
     private func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
