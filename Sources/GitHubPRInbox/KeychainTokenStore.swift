@@ -15,6 +15,19 @@ enum KeychainStoreError: LocalizedError {
     }
 }
 
+enum KeychainTokenAccessibility: Equatable {
+    /// Keeps credentials off backups and other devices. The menu-bar app only reads
+    /// GitHub credentials while the signed-in macOS user has unlocked the device.
+    case whenUnlockedThisDeviceOnly
+
+    var securityValue: CFString {
+        switch self {
+        case .whenUnlockedThisDeviceOnly:
+            kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        }
+    }
+}
+
 struct KeychainTokenStore {
     static let shared = KeychainTokenStore(
         service: "com.github-pr-inbox.github-app-auth",
@@ -23,6 +36,17 @@ struct KeychainTokenStore {
 
     let service: String
     let account: String
+    let accessibility: KeychainTokenAccessibility
+
+    init(
+        service: String,
+        account: String,
+        accessibility: KeychainTokenAccessibility = .whenUnlockedThisDeviceOnly
+    ) {
+        self.service = service
+        self.account = account
+        self.accessibility = accessibility
+    }
 
     func saveCredential(_ credential: GitHubCredential) throws {
         let encoder = JSONEncoder()
@@ -58,19 +82,28 @@ struct KeychainTokenStore {
     }
 
     private func save(data: Data) throws {
-        let query = baseQuery as CFDictionary
-        SecItemDelete(query)
-
-        let attributes: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
+        let updatedAttributes: [String: Any] = [
             kSecValueData as String: data,
+            kSecAttrAccessible as String: accessibility.securityValue,
         ]
 
-        let status = SecItemAdd(attributes as CFDictionary, nil)
-        guard status == errSecSuccess else {
-            throw KeychainStoreError.unexpectedStatus(status)
+        // Refresh-token rotation must not delete the working token before its
+        // replacement is safely committed. Update first, then create the item only
+        // when this is the user's first sign-in.
+        let updateStatus = SecItemUpdate(baseQuery as CFDictionary, updatedAttributes as CFDictionary)
+        switch updateStatus {
+        case errSecSuccess:
+            return
+        case errSecItemNotFound:
+            var newItem = baseQuery
+            newItem.merge(updatedAttributes) { _, replacement in replacement }
+
+            let addStatus = SecItemAdd(newItem as CFDictionary, nil)
+            guard addStatus == errSecSuccess else {
+                throw KeychainStoreError.unexpectedStatus(addStatus)
+            }
+        default:
+            throw KeychainStoreError.unexpectedStatus(updateStatus)
         }
     }
 

@@ -169,18 +169,20 @@ struct SettingsView: View {
             case let .ssoRequired(_, message):
                 authMessage(message, tone: .warning)
 
+                Text("Complete organization SSO in your browser, then reconnect. If the organization is still unavailable, revoke this GitHub App authorization on GitHub and reconnect so GitHub can issue an SSO-authorized token.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
                 HStack(spacing: 10) {
                     Button("Open Org SSO") {
                         model.openSSOAuthorization()
                     }
 
-                    Button("Retry Auth Check") {
-                        Task {
-                            await model.refreshAuthStatus()
-                        }
+                    Button("Manage App Authorization") {
+                        model.openGitHubAppAuthorizations()
                     }
 
-                    Button("Reconnect") {
+                    Button("Reconnect After SSO") {
                         Task {
                             await model.beginSignIn()
                         }

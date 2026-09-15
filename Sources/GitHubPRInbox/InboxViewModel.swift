@@ -285,6 +285,17 @@ final class InboxViewModel: ObservableObject {
         }
     }
 
+    func openGitHubAppAuthorizations() {
+        // GitHub lets users revoke a prior GitHub App authorization here. A fresh
+        // authorization after establishing SAML SSO is required when the original
+        // authorization was created without an active organization SSO session.
+        guard let url = URL(string: "https://github.com/settings/apps/authorizations") else {
+            return
+        }
+
+        NSWorkspace.shared.open(url)
+    }
+
     func openAppInstallationPage() {
         guard let url = appInstallURL else {
             return
