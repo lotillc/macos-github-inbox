@@ -802,7 +802,18 @@ final class InboxViewModel: ObservableObject {
     }
 
     private func makeClient(scopes: [RepositoryScope]) -> GitHubClient {
-        GitHubClient(session: clientSession, authProvider: authProvider, scopes: scopes)
+        let summary = repositoryInventorySummary
+        let organizationOwners = Set(summary?.organizationOwners.map { $0.lowercased() } ?? [])
+        let ownerScopes = (summary?.authorizedOwners ?? []).map { owner -> RepositoryScope in
+            organizationOwners.contains(owner.lowercased()) ? .org(owner) : .user(owner)
+        }
+        return GitHubClient(
+            session: clientSession,
+            authProvider: authProvider,
+            scopes: scopes,
+            accessibleRepositoryNames: summary?.accessibleRepositories ?? [],
+            ownerScopes: ownerScopes
+        )
     }
 
     private func refreshCIStatusesForVisibleItems(connectionGeneration: UInt) async {

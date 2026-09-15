@@ -704,6 +704,163 @@ struct GitHubAuthProviderTests {
     }
 
     @Test
+    func fallsBackToRepositoryQueriesWhenOwnerSearchExceedsResultLimit() async throws {
+        let requests = LockedRequestCounter()
+        let session = makeMockSession { request in
+            let url = try #require(request.url)
+            let query = try #require(URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?
+                .first(where: { $0.name == "q" })?.value)
+            requests.increment()
+
+            if query.contains("org:acme") {
+                return jsonResponse(statusCode: 200, body: #"{ "total_count": 1001, "items": [] }"#)
+            }
+
+            #expect(query.contains("repo:acme/backend"))
+            return jsonResponse(
+                statusCode: 200,
+                body: #"""
+                {
+                  "total_count": 1,
+                  "items": [{
+                    "number": 42,
+                    "title": "Review me",
+                    "html_url": "https://github.com/acme/backend/pull/42",
+                    "repository_url": "https://api.github.com/repos/acme/backend",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "updated_at": "2026-01-02T00:00:00Z",
+                    "draft": false
+                  }]
+                }
+                """#
+            )
+        }
+        let client = GitHubClient(
+            session: session,
+            tokenProvider: { "ghu_test" },
+            accessibleRepositoryNames: ["acme/backend"],
+            ownerScopes: [.org("acme")]
+        )
+
+        let items = try await client.fetchOpenPullRequests(
+            filter: "is:open is:pr review-requested:@me",
+            scopes: [.repo("acme/backend")]
+        )
+
+        #expect(items.map(\.repositoryName) == ["acme/backend"])
+        #expect(requests.value == 2)
+    }
+
+    @Test
+    func fetchesExactlyTenPagesForExactlyOneThousandSearchResults() async throws {
+        let requests = LockedRequestCounter()
+        let session = makeMockSession { request in
+            let url = try #require(request.url)
+            let page = Int(URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?
+                .first(where: { $0.name == "page" })?.value ?? "") ?? 0
+            #expect((1...10).contains(page))
+            requests.increment()
+            let start = (page - 1) * 100
+            let items = (start..<(start + 100)).map(searchItemJSON).joined(separator: ",")
+            return jsonResponse(statusCode: 200, body: #"{ "total_count": 1000, "items": ["# + items + #"] }"#)
+        }
+        let client = GitHubClient(session: session, tokenProvider: { "ghu_test" })
+
+        let items = try await client.fetchOpenPullRequests(
+            filter: "is:open is:pr",
+            scopes: [.repo("acme/backend")]
+        )
+
+        #expect(items.count == 1_000)
+        #expect(requests.value == 10)
+    }
+
+    @Test
+    func rejectsOverCapRepositoryFallbackInsteadOfReturningPartialResults() async throws {
+        let session = makeMockSession { request in
+            let url = try #require(request.url)
+            let query = try #require(URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?
+                .first(where: { $0.name == "q" })?.value)
+            if query.contains("org:acme") {
+                return jsonResponse(statusCode: 200, body: #"{ "total_count": 1001, "items": [] }"#)
+            }
+            return jsonResponse(statusCode: 200, body: #"{ "total_count": 1001, "items": [] }"#)
+        }
+        let client = GitHubClient(
+            session: session,
+            tokenProvider: { "ghu_test" },
+            accessibleRepositoryNames: ["acme/backend"],
+            ownerScopes: [.org("acme")]
+        )
+
+        do {
+            _ = try await client.fetchOpenPullRequests(filter: "is:open is:pr", scopes: [.repo("acme/backend")])
+            Issue.record("Expected the over-cap repository fallback to be rejected.")
+        } catch let error as GitHubClientError {
+            if case let .configuration(message) = error {
+                #expect(message.contains("1,000"))
+            } else {
+                Issue.record("Expected a completeness configuration error, received \(error).")
+            }
+        }
+    }
+
+    @Test
+    func fallsBackWhenOwnerSearchIsIncomplete() async throws {
+        let requests = LockedRequestCounter()
+        let session = makeMockSession { request in
+            let url = try #require(request.url)
+            let query = try #require(URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?
+                .first(where: { $0.name == "q" })?.value)
+            if query.contains("org:acme") {
+                requests.increment()
+                let items = (1...100).map(searchItemJSON).joined(separator: ",")
+                return jsonResponse(statusCode: 200, body: #"{ "total_count": 100, "incomplete_results": true, "items": ["# + items + #"] }"#)
+            }
+            requests.increment()
+            return jsonResponse(
+                statusCode: 200,
+                body: #"""
+                { "total_count": 1, "incomplete_results": false, "items": [
+                  { "number": 42, "title": "Review me", "html_url": "https://github.com/acme/backend/pull/42", "repository_url": "https://api.github.com/repos/acme/backend", "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-02T00:00:00Z", "draft": false }
+                ] }
+                """#
+            )
+        }
+        let client = GitHubClient(
+            session: session,
+            tokenProvider: { "ghu_test" },
+            accessibleRepositoryNames: ["acme/backend"],
+            ownerScopes: [.org("acme")]
+        )
+
+        let items = try await client.fetchOpenPullRequests(filter: "is:open is:pr", scopes: [.repo("acme/backend")])
+
+        #expect(items.map(\.repositoryName) == ["acme/backend"])
+        #expect(requests.value == 2)
+    }
+
+    @Test
+    func rejectsIncompleteDirectRepositorySearch() async throws {
+        let session = makeMockSession { _ in
+            jsonResponse(statusCode: 200, body: #"{ "total_count": 1, "incomplete_results": true, "items": [] }"#)
+        }
+        let client = GitHubClient(session: session, tokenProvider: { "ghu_test" })
+
+        do {
+            _ = try await client.fetchOpenPullRequests(filter: "is:open is:pr", scopes: [.repo("acme/backend")])
+            Issue.record("Expected incomplete direct search to be rejected.")
+        } catch let error as GitHubClientError {
+            if case let .configuration(message) = error {
+                #expect(message.localizedCaseInsensitiveContains("did not complete"))
+                #expect(!message.contains("1,000"))
+            } else {
+                Issue.record("Expected a completeness configuration error, received \(error).")
+            }
+        }
+    }
+
+    @Test
     func usesUpdatedRuntimeConfigurationForDeviceAuthorization() async throws {
         let store = KeychainTokenStore(
             service: "com.github-pr-inbox.tests.\(UUID().uuidString)",
@@ -1772,6 +1929,12 @@ private func jsonResponse(
         headerFields: responseHeaders
     )!
     return (response, Data(body.utf8))
+}
+
+private func searchItemJSON(number: Int) -> String {
+    """
+    {"number": \(number), "title": "PR \(number)", "html_url": "https://github.com/acme/backend/pull/\(number)", "repository_url": "https://api.github.com/repos/acme/backend", "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-02T00:00:00Z", "draft": false}
+    """
 }
 
 private func makeDelayedInstallationSession(
