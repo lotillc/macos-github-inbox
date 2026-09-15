@@ -164,7 +164,7 @@ final class InboxViewModel: ObservableObject {
             async let reviewItems = client.fetchOpenPullRequests(filter: reviewQualifier, scopes: scopes)
             async let authoredItems = client.fetchOpenPullRequests(filter: authoredQualifier, scopes: scopes)
             async let trackedWorkflowFailures = client.fetchFailedWorkflowRuns(
-                repositoryNames: settings.explicitRepositoryScopes,
+                repositoryNames: workflowRepositoryNames,
                 trackedWorkflowNames: settings.trackedWorkflowNames
             )
             let reviewResults = try await reviewItems
@@ -228,9 +228,7 @@ final class InboxViewModel: ObservableObject {
             NSWorkspace.shared.open(authorization.browserURL)
             authStatusMessage = "Verification code copied to the clipboard."
 
-            signInTask = Task { [weak self] in
-                await self?.completePendingAuthPoll()
-            }
+            startPendingAuthPoll()
         } catch {
             guard isCurrentConnection(generation) else {
                 return
@@ -292,6 +290,20 @@ final class InboxViewModel: ObservableObject {
                 guard isCurrentConnection(generation) else {
                     return
                 }
+
+                if let authorization = await retryablePendingAuthorization(after: error) {
+                    authState = .authorizing(authorization)
+                    authStatusMessage = "GitHub sign-in is temporarily unavailable. Retrying…"
+                    do {
+                        try await Task.sleep(nanoseconds: UInt64(max(authorization.interval, 1) * 1_000_000_000))
+                    } catch is CancellationError {
+                        return
+                    } catch {
+                        return
+                    }
+                    continue
+                }
+
                 signInTask = nil
                 mapAuthError(error)
                 return
@@ -346,6 +358,7 @@ final class InboxViewModel: ObservableObject {
                 return
             }
             authState = .authorizing(pendingAuthorization)
+            startPendingAuthPoll()
             return
         }
 
@@ -847,6 +860,30 @@ final class InboxViewModel: ObservableObject {
         }
     }
 
+    private var workflowRepositoryNames: [String] {
+        let explicitRepositories = settings.explicitRepositoryScopes
+        let ownerScopes = Set(settings.scopes.compactMap { scope -> String? in
+            switch scope {
+            case let .org(owner), let .user(owner):
+                return owner.lowercased()
+            case .repo:
+                return nil
+            }
+        })
+
+        guard !ownerScopes.isEmpty else {
+            return explicitRepositories
+        }
+
+        let ownerRepositories = (repositoryInventorySummary?.accessibleRepositories ?? []).filter { repository in
+            guard let owner = repository.split(separator: "/", maxSplits: 1).first else {
+                return false
+            }
+            return ownerScopes.contains(owner.lowercased())
+        }
+        return Array(Set(explicitRepositories + ownerRepositories)).sorted()
+    }
+
     private func setAuthenticatedSession(_ summary: GitHubSessionSummary) {
         lastKnownSessionSummary = summary
         authState = .signedIn(summary)
@@ -855,6 +892,24 @@ final class InboxViewModel: ObservableObject {
     private func invalidateConnection() {
         connectionGeneration &+= 1
         isLoading = false
+    }
+
+    private func startPendingAuthPoll() {
+        guard signInTask == nil else {
+            return
+        }
+
+        signInTask = Task { [weak self] in
+            await self?.completePendingAuthPoll()
+        }
+    }
+
+    private func retryablePendingAuthorization(after error: Error) async -> GitHubDeviceAuthorization? {
+        guard case .network = error as? GitHubAuthError else {
+            return nil
+        }
+
+        return await authProvider.pendingAuthorizationState()
     }
 
     private func isCurrentConnection(_ generation: UInt) -> Bool {

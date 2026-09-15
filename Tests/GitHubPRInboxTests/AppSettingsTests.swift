@@ -481,6 +481,66 @@ struct AppSettingsTests {
     }
 
     @Test
+    func ownerWatchScopesContinueCheckingTrackedWorkflowRepositories() async throws {
+        let tokenStore = testTokenStore(account: "owner-workflow-repositories")
+        defer { try? tokenStore.deleteCredential() }
+        let settings = makeSettings(
+            account: "owner-workflow-repositories",
+            tokenStore: tokenStore,
+            configuration: GitHubAuthConfiguration(clientID: "", appSlug: "", expectedOwners: [])
+        )
+        let session = makeSettingsMockSession { request in
+            let url = try #require(request.url)
+            switch (url.host, url.path) {
+            case ("api.github.com", "/user/installations"):
+                return settingsJSONResponse(
+                    statusCode: 200,
+                    body: #"{ "installations": [{ "id": 1, "account": { "login": "acme", "type": "Organization" }, "repository_selection": "selected" }] }"#
+                )
+            case ("api.github.com", "/user/installations/1/repositories"):
+                return settingsJSONResponse(
+                    statusCode: 200,
+                    body: #"{ "repositories": [{ "full_name": "acme/backend" }] }"#
+                )
+            case ("api.github.com", "/user"):
+                return settingsJSONResponse(statusCode: 200, body: #"{ "id": 7, "login": "mona" }"#)
+            case ("api.github.com", "/search/issues"):
+                return settingsJSONResponse(statusCode: 200, body: #"{ "items": [] }"#)
+            case ("api.github.com", "/repos/acme/backend/actions/runs"):
+                return settingsJSONResponse(
+                    statusCode: 200,
+                    body: #"{ "workflow_runs": [{ "id": 1, "name": "Build", "status": "completed", "conclusion": "failure", "head_branch": "main", "html_url": "https://github.com/acme/backend/actions/runs/1", "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z" }] }"#
+                )
+            default:
+                throw NSError(domain: "SettingsMockURLProtocol", code: 13)
+            }
+        }
+        let provider = GitHubAuthProvider(
+            configuration: settings.gitHubAppConfiguration,
+            session: session,
+            tokenStore: tokenStore
+        )
+        let model = InboxViewModel(settings: settings, authProvider: provider, clientSession: session)
+        guard await waitForMissingConfiguration(in: model, timeout: 2) else {
+            Issue.record("The initial refresh did not finish with the intentionally missing configuration.")
+            return
+        }
+
+        _ = try settings.saveGitHubAppConfiguration(
+            clientID: "Iv1.test",
+            appSlug: "test-app",
+            expectedOwner: ""
+        )
+        try tokenStore.saveCredential(testCredential())
+        settings.allowlistText = "org:acme"
+        settings.trackedWorkflowNamesText = "Build"
+
+        await model.refresh()
+
+        #expect(model.workflowFailures.map(\.repositoryName) == ["acme/backend"])
+    }
+
+    @Test
     func ignoresUnexpandedBuildSettingPlaceholders() {
         let configuration = GitHubAuthConfiguration.load(
             environment: [:],

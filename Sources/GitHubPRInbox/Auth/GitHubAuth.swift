@@ -430,6 +430,10 @@ actor GitHubAuthProvider {
     private var refreshTaskGeneration: UInt?
     private var refreshTaskNonce: UInt?
     private var nextRefreshTaskNonce: UInt = 0
+    private var pendingRefreshTask: Task<PendingGitHubDeviceCredential, Error>?
+    private var pendingRefreshTaskGeneration: UInt?
+    private var pendingRefreshTaskNonce: UInt?
+    private var nextPendingRefreshTaskNonce: UInt = 0
 
     init(
         configuration: GitHubAuthConfiguration = .load(),
@@ -466,6 +470,10 @@ actor GitHubAuthProvider {
         refreshTask = nil
         refreshTaskGeneration = nil
         refreshTaskNonce = nil
+        pendingRefreshTask?.cancel()
+        pendingRefreshTask = nil
+        pendingRefreshTaskGeneration = nil
+        pendingRefreshTaskNonce = nil
         if isDifferentAppIdentity(configuration, self.configuration) {
             pendingAuthorization = nil
             try? tokenStore.deletePendingDeviceCredential()
@@ -479,6 +487,10 @@ actor GitHubAuthProvider {
         refreshTask = nil
         refreshTaskGeneration = nil
         refreshTaskNonce = nil
+        pendingRefreshTask?.cancel()
+        pendingRefreshTask = nil
+        pendingRefreshTaskGeneration = nil
+        pendingRefreshTaskNonce = nil
         pendingAuthorization = nil
         try tokenStore.deleteCredential()
         try tokenStore.deletePendingDeviceCredential()
@@ -585,7 +597,8 @@ actor GitHubAuthProvider {
             pendingCredential,
             expectedScopes: expectedScopes,
             configuration: configuration,
-            context: context
+            context: context,
+            forceRefresh: false
         )
         return .completed(credential)
     }
@@ -600,7 +613,8 @@ actor GitHubAuthProvider {
                     pendingCredential,
                     expectedScopes: expectedScopes,
                     configuration: configuration,
-                    context: context
+                    context: context,
+                    forceRefresh: false
                 )
             } catch let error as GitHubAuthError where isTerminalPendingDeviceCredentialError(error) {
                 // A newly issued token can still be revoked before its first
@@ -641,7 +655,8 @@ actor GitHubAuthProvider {
                     pendingCredential,
                     expectedScopes: expectedScopes,
                     configuration: configuration,
-                    context: context
+                    context: context,
+                    forceRefresh: true
                 )
             } catch let error as GitHubAuthError where isTerminalPendingDeviceCredentialError(error) {
                 try tokenStore.deletePendingDeviceCredential()
@@ -674,9 +689,11 @@ actor GitHubAuthProvider {
             expectedScopes: expectedScopes,
             configuration: configuration
         )
-        let updatedCredential = credential.updating(validation: validation)
-        try ensureCurrent(context)
-        try tokenStore.saveCredential(updatedCredential)
+        let updatedCredential = try saveValidation(
+            validation,
+            for: credential,
+            context: context
+        )
 
         return GitHubSessionSummary(
             user: GitHubUser(login: updatedCredential.userLogin),
@@ -694,6 +711,10 @@ actor GitHubAuthProvider {
         refreshTask = nil
         refreshTaskGeneration = nil
         refreshTaskNonce = nil
+        pendingRefreshTask?.cancel()
+        pendingRefreshTask = nil
+        pendingRefreshTaskGeneration = nil
+        pendingRefreshTaskNonce = nil
         pendingAuthorization = nil
         try tokenStore.deleteCredential()
         try tokenStore.deletePendingDeviceCredential()
@@ -706,6 +727,10 @@ actor GitHubAuthProvider {
         refreshTask = nil
         refreshTaskGeneration = nil
         refreshTaskNonce = nil
+        pendingRefreshTask?.cancel()
+        pendingRefreshTask = nil
+        pendingRefreshTaskGeneration = nil
+        pendingRefreshTaskNonce = nil
         pendingAuthorization = nil
         try? tokenStore.deletePendingDeviceCredential()
     }
@@ -843,8 +868,15 @@ actor GitHubAuthProvider {
         _ pendingCredential: PendingGitHubDeviceCredential,
         expectedScopes: [RepositoryScope],
         configuration: GitHubAuthConfiguration,
-        context: AuthenticationContext
+        context: AuthenticationContext,
+        forceRefresh: Bool
     ) async throws -> GitHubCredential {
+        let pendingCredential = try await refreshedPendingDeviceCredentialIfNeeded(
+            pendingCredential,
+            configuration: configuration,
+            context: context,
+            forceRefresh: forceRefresh
+        )
         let user = try await fetchCurrentUser(token: pendingCredential.accessToken)
         try ensureCurrent(context)
         var credential = GitHubCredential(
@@ -883,6 +915,125 @@ actor GitHubAuthProvider {
             return true
         }
         return false
+    }
+
+    private func refreshedPendingDeviceCredentialIfNeeded(
+        _ credential: PendingGitHubDeviceCredential,
+        configuration: GitHubAuthConfiguration,
+        context: AuthenticationContext,
+        forceRefresh: Bool
+    ) async throws -> PendingGitHubDeviceCredential {
+        let threshold = Date().addingTimeInterval(300)
+        guard forceRefresh || (credential.accessTokenExpiresAt != nil && credential.accessTokenExpiresAt! <= threshold) else {
+            return credential
+        }
+
+        if let pendingRefreshTask, pendingRefreshTaskGeneration == context.generation {
+            return try await pendingRefreshTask.value
+        }
+
+        let task = Task { [self] in
+            try await performPendingCredentialRefresh(
+                credential,
+                configuration: configuration,
+                context: context
+            )
+        }
+        pendingRefreshTask = task
+        pendingRefreshTaskGeneration = context.generation
+        nextPendingRefreshTaskNonce &+= 1
+        let taskNonce = nextPendingRefreshTaskNonce
+        pendingRefreshTaskNonce = taskNonce
+
+        do {
+            let refreshedCredential = try await task.value
+            clearPendingRefreshTaskIfCurrent(context: context, nonce: taskNonce)
+            return refreshedCredential
+        } catch {
+            clearPendingRefreshTaskIfCurrent(context: context, nonce: taskNonce)
+            throw error
+        }
+    }
+
+    private func performPendingCredentialRefresh(
+        _ credential: PendingGitHubDeviceCredential,
+        configuration: GitHubAuthConfiguration,
+        context: AuthenticationContext
+    ) async throws -> PendingGitHubDeviceCredential {
+
+        guard let refreshToken = credential.refreshToken else {
+            throw GitHubAuthError.refreshFailed("GitHub sign-in expired. Reconnect in Settings.")
+        }
+
+        if let refreshExpiry = credential.refreshTokenExpiresAt, refreshExpiry <= Date() {
+            throw GitHubAuthError.refreshFailed("GitHub sign-in expired. Reconnect in Settings.")
+        }
+
+        let url = URL(string: "https://github.com/login/oauth/access_token")!
+        let request = try formRequest(
+            url: url,
+            parameters: [
+                "client_id": configuration.clientID,
+                "refresh_token": refreshToken,
+                "grant_type": "refresh_token",
+            ]
+        )
+        let data = try await send(request)
+        let response = try decode(TokenResponse.self, from: data)
+
+        if let error = response.error {
+            switch error {
+            case "bad_refresh_token", "incorrect_client_credentials":
+                throw GitHubAuthError.refreshFailed("GitHub sign-in expired. Reconnect in Settings.")
+            default:
+                throw GitHubAuthError.refreshFailed(response.errorDescription ?? "Could not refresh the GitHub session.")
+            }
+        }
+
+        guard let accessToken = response.accessToken else {
+            throw GitHubAuthError.refreshFailed("GitHub did not return a refreshed access token.")
+        }
+
+        try ensureCurrent(context)
+        let refreshedCredential = PendingGitHubDeviceCredential(
+            accessToken: accessToken,
+            refreshToken: response.refreshToken ?? credential.refreshToken,
+            accessTokenExpiresAt: response.expiresIn.map { Date().addingTimeInterval(TimeInterval($0)) },
+            refreshTokenExpiresAt: response.refreshTokenExpiresIn.map { Date().addingTimeInterval(TimeInterval($0)) }
+                ?? credential.refreshTokenExpiresAt
+        )
+        try tokenStore.savePendingDeviceCredential(refreshedCredential)
+        return refreshedCredential
+    }
+
+    private func clearPendingRefreshTaskIfCurrent(
+        context: AuthenticationContext,
+        nonce: UInt
+    ) {
+        guard pendingRefreshTaskGeneration == context.generation, pendingRefreshTaskNonce == nonce else {
+            return
+        }
+
+        pendingRefreshTask = nil
+        pendingRefreshTaskGeneration = nil
+        pendingRefreshTaskNonce = nil
+    }
+
+    private func saveValidation(
+        _ validation: GitHubAccessValidation,
+        for credential: GitHubCredential,
+        context: AuthenticationContext
+    ) throws -> GitHubCredential {
+        try ensureCurrent(context)
+
+        // Validation can suspend while another request refreshes an expired
+        // token. Preserve that rotated token and refresh-token pair, while
+        // applying the validation inventory gathered by this request.
+        let currentCredential = try tokenStore.loadCredential()
+        let credentialToUpdate = currentCredential ?? credential
+        let updatedCredential = credentialToUpdate.updating(validation: validation)
+        try tokenStore.saveCredential(updatedCredential)
+        return updatedCredential
     }
 
     private func fetchCurrentUser(token: String) async throws -> UserResponse {
@@ -1134,6 +1285,8 @@ actor GitHubAuthProvider {
             }
 
             return .installationMissing([], [], message.isEmpty ? "GitHub denied access to one or more watched owners or repositories." : message)
+        case 500...599:
+            return .network("GitHub API error \(statusCode): \(message)")
         default:
             return .invalidResponse("GitHub API error \(statusCode): \(message)")
         }

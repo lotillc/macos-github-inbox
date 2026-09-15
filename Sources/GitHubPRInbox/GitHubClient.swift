@@ -587,6 +587,11 @@ actor GitHubClient {
             return data
         } catch let error as GitHubClientError {
             throw error
+        } catch let error as GitHubAuthError {
+            // A forced refresh can surface reconnect, rate-limit, or SSO
+            // recovery guidance. Preserve it so the view model can render the
+            // appropriate recovery action instead of reporting a network fault.
+            throw error
         } catch {
             throw GitHubClientError.network(error.localizedDescription)
         }

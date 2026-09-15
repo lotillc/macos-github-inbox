@@ -342,6 +342,173 @@ struct GitHubAuthProviderTests {
     }
 
     @Test
+    func refreshesExpiredPendingDeviceTokenBeforeResolvingIt() async throws {
+        let store = KeychainTokenStore(
+            service: "com.github-pr-inbox.tests.\(UUID().uuidString)",
+            account: "expired-pending-device-token"
+        )
+        defer {
+            try? store.deleteCredential()
+            try? store.deletePendingDeviceCredential()
+        }
+        try store.savePendingDeviceCredential(
+            PendingGitHubDeviceCredential(
+                accessToken: "ghu_expired",
+                refreshToken: "ghr_issued",
+                accessTokenExpiresAt: Date().addingTimeInterval(-60),
+                refreshTokenExpiresAt: Date().addingTimeInterval(60 * 60 * 24)
+            )
+        )
+
+        let session = makeMockSession { request in
+            let url = try #require(request.url)
+            switch (url.host, url.path) {
+            case ("github.com", "/login/oauth/access_token"):
+                #expect(formBody(in: request).contains("refresh_token=ghr_issued"))
+                return jsonResponse(
+                    statusCode: 200,
+                    body: #"{ "access_token": "ghu_refreshed", "refresh_token": "ghr_refreshed", "expires_in": 28800 }"#
+                )
+            case ("api.github.com", "/user"):
+                #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer ghu_refreshed")
+                return jsonResponse(statusCode: 200, body: #"{ "id": 7, "login": "mona" }"#)
+            case ("api.github.com", "/user/installations"):
+                return jsonResponse(statusCode: 200, body: #"{ "installations": [] }"#)
+            default:
+                throw NSError(domain: "MockURLProtocol", code: 15)
+            }
+        }
+
+        let credential = try await testProvider(session: session, store: store)
+            .refreshIfNeeded(expectedScopes: [])
+
+        #expect(credential.accessToken == "ghu_refreshed")
+        #expect(credential.refreshToken == "ghr_refreshed")
+        #expect(try store.loadPendingDeviceCredential() == nil)
+    }
+
+    @Test
+    func validationDoesNotOverwriteCredentialRotatedWhileItWasInFlight() async throws {
+        let store = KeychainTokenStore(
+            service: "com.github-pr-inbox.tests.\(UUID().uuidString)",
+            account: "validation-refresh-race"
+        )
+        defer { try? store.deleteCredential() }
+        try store.saveCredential(testCredential())
+
+        let validationStarted = DispatchSemaphore(value: 0)
+        let allowValidation = DispatchSemaphore(value: 0)
+        let installationRequests = LockedRequestCounter()
+        let session = makeDelayedMockSession { request, protocolInstance in
+            guard let url = request.url else {
+                protocolInstance.fail(with: NSError(domain: "MockURLProtocol", code: 17))
+                return
+            }
+            switch (url.host, url.path) {
+            case ("api.github.com", "/user/installations"):
+                installationRequests.increment()
+                if installationRequests.value == 1 {
+                    validationStarted.signal()
+                    let delayedProtocol = DelayedProtocolReference(protocolInstance)
+                    DispatchQueue.global().async {
+                        guard allowValidation.wait(timeout: .now() + 5) == .success else {
+                            delayedProtocol.value.fail(with: NSError(domain: "MockURLProtocol", code: 16))
+                            return
+                        }
+                        delayedProtocol.value.respond(with: jsonResponse(statusCode: 200, body: #"{ "installations": [] }"#))
+                    }
+                    return
+                }
+                protocolInstance.respond(with: jsonResponse(statusCode: 200, body: #"{ "installations": [] }"#))
+            case ("github.com", "/login/oauth/access_token"):
+                protocolInstance.respond(with: jsonResponse(
+                    statusCode: 200,
+                    body: #"{ "access_token": "ghu_rotated", "refresh_token": "ghr_rotated", "expires_in": 28800 }"#
+                ))
+            case ("api.github.com", "/user"):
+                protocolInstance.respond(with: jsonResponse(statusCode: 200, body: #"{ "id": 7, "login": "mona" }"#))
+            default:
+                protocolInstance.fail(with: NSError(domain: "MockURLProtocol", code: 17))
+            }
+        }
+        let provider = testProvider(session: session, store: store)
+
+        let validation = Task { try await provider.validateOrgAccess(expectedScopes: []) }
+        #expect(await waitForSemaphore(validationStarted, timeout: 2) == .success)
+
+        let refreshedCredential = try await provider.forceRefresh(expectedScopes: [])
+        #expect(refreshedCredential.accessToken == "ghu_rotated")
+        allowValidation.signal()
+        _ = try await validation.value
+
+        let storedCredential = try #require(try store.loadCredential())
+        #expect(storedCredential.accessToken == "ghu_rotated")
+        #expect(storedCredential.refreshToken == "ghr_rotated")
+    }
+
+    @Test
+    func coalescesConcurrentPendingCredentialRefreshes() async throws {
+        let store = KeychainTokenStore(
+            service: "com.github-pr-inbox.tests.\(UUID().uuidString)",
+            account: "coalesced-pending-refresh"
+        )
+        defer {
+            try? store.deleteCredential()
+            try? store.deletePendingDeviceCredential()
+        }
+        try store.savePendingDeviceCredential(
+            PendingGitHubDeviceCredential(
+                accessToken: "ghu_expired",
+                refreshToken: "ghr_previous",
+                accessTokenExpiresAt: Date().addingTimeInterval(-60),
+                refreshTokenExpiresAt: Date().addingTimeInterval(60 * 60)
+            )
+        )
+
+        let refreshStarted = DispatchSemaphore(value: 0)
+        let releaseRefresh = DispatchSemaphore(value: 0)
+        let refreshRequests = LockedRequestCounter()
+        let session = makeDelayedMockSession { request, protocolInstance in
+            guard let url = request.url else {
+                protocolInstance.fail(with: NSError(domain: "MockURLProtocol", code: 18))
+                return
+            }
+            switch (url.host, url.path) {
+            case ("github.com", "/login/oauth/access_token"):
+                refreshRequests.increment()
+                refreshStarted.signal()
+                let delayedProtocol = DelayedProtocolReference(protocolInstance)
+                DispatchQueue.global().async {
+                    guard releaseRefresh.wait(timeout: .now() + 5) == .success else {
+                        delayedProtocol.value.fail(with: NSError(domain: "MockURLProtocol", code: 19))
+                        return
+                    }
+                    delayedProtocol.value.respond(with: jsonResponse(
+                        statusCode: 200,
+                        body: #"{ "access_token": "ghu_rotated", "refresh_token": "ghr_rotated", "expires_in": 28800 }"#
+                    ))
+                }
+            case ("api.github.com", "/user"):
+                protocolInstance.respond(with: jsonResponse(statusCode: 200, body: #"{ "id": 7, "login": "mona" }"#))
+            case ("api.github.com", "/user/installations"):
+                protocolInstance.respond(with: jsonResponse(statusCode: 200, body: #"{ "installations": [] }"#))
+            default:
+                protocolInstance.fail(with: NSError(domain: "MockURLProtocol", code: 20))
+            }
+        }
+        let provider = testProvider(session: session, store: store)
+
+        let first = Task { try await provider.refreshIfNeeded(expectedScopes: []) }
+        #expect(await waitForSemaphore(refreshStarted, timeout: 2) == .success)
+        let second = Task { try await provider.refreshIfNeeded(expectedScopes: []) }
+        releaseRefresh.signal()
+
+        #expect(try await first.value.accessToken == "ghu_rotated")
+        #expect(try await second.value.accessToken == "ghu_rotated")
+        #expect(refreshRequests.value == 1)
+    }
+
+    @Test
     func coalescesConcurrentRefreshesThatWouldReuseARotatingToken() async throws {
         let store = KeychainTokenStore(
             service: "com.github-pr-inbox.tests.\(UUID().uuidString)",
@@ -795,6 +962,27 @@ struct GitHubAuthProviderTests {
         #expect(await refreshTracker.didRefresh())
         #expect(user == GitHubUser(login: "mona"))
     }
+
+    @Test
+    func gitHubClientPreservesAuthenticationErrorsFromForcedRefresh() async throws {
+        let session = makeMockSession { _ in
+            jsonResponse(statusCode: 401, body: #"{ "message": "Bad credentials" }"#)
+        }
+        let client = GitHubClient(
+            session: session,
+            tokenProvider: { "stale-token" },
+            refreshTokenProvider: {
+                throw GitHubAuthError.ssoRequired(["acme"], "GitHub authorization needs SSO.")
+            }
+        )
+
+        do {
+            _ = try await client.validateToken()
+            Issue.record("Expected the forced refresh error to propagate.")
+        } catch let error as GitHubAuthError {
+            #expect(error == .ssoRequired(["acme"], "GitHub authorization needs SSO."))
+        }
+    }
 }
 
 private func testCredential() -> GitHubCredential {
@@ -885,6 +1073,56 @@ private func makeMockSession(
     let configuration = URLSessionConfiguration.ephemeral
     configuration.protocolClasses = [MockURLProtocol.self]
     MockURLProtocol.requestHandler = handler
+    return URLSession(configuration: configuration)
+}
+
+private final class DelayedMockURLProtocol: URLProtocol {
+    nonisolated(unsafe) static var requestHandler: ((URLRequest, DelayedMockURLProtocol) -> Void)?
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        true
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
+        request
+    }
+
+    override func startLoading() {
+        guard let handler = Self.requestHandler else {
+            fail(with: NSError(domain: "DelayedMockURLProtocol", code: 0))
+            return
+        }
+        handler(request, self)
+    }
+
+    override func stopLoading() {}
+
+    func respond(with responseAndData: (HTTPURLResponse, Data)) {
+        client?.urlProtocol(self, didReceive: responseAndData.0, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: responseAndData.1)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    func fail(with error: Error) {
+        client?.urlProtocol(self, didFailWithError: error)
+    }
+}
+
+private struct DelayedProtocolReference<Value>: @unchecked Sendable {
+    let value: Value
+
+    init(_ value: Value) {
+        self.value = value
+    }
+}
+
+private func makeDelayedMockSession(
+    handler: @escaping (URLRequest, DelayedMockURLProtocol) -> Void
+) -> URLSession {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.httpMaximumConnectionsPerHost = 4
+    configuration.protocolClasses = [DelayedMockURLProtocol.self]
+    DelayedMockURLProtocol.requestHandler = handler
     return URLSession(configuration: configuration)
 }
 

@@ -416,9 +416,11 @@ struct SettingsView: View {
                         RepositoryScope.repo($0).ownerName.caseInsensitiveCompare(owner) == .orderedSame
                     }
                     VStack(alignment: .leading, spacing: 6) {
-                        if isOrganizationOwner(owner) || isPersonalAccountOwner(owner) {
+                        if isAvailableOwner(owner) || hasOwnerScope(owner) {
                             Toggle(
-                                "Watch all repositories in \(owner)",
+                                isAvailableOwner(owner)
+                                    ? "Watch all repositories in \(owner)"
+                                    : "Watch all repositories in \(owner) (no longer available)",
                             isOn: Binding(
                                     get: { hasOwnerScope(owner) },
                                     set: { isWatchingAll in
@@ -501,6 +503,10 @@ struct SettingsView: View {
         }
     }
 
+    private func isAvailableOwner(_ owner: String) -> Bool {
+        isOrganizationOwner(owner) || isPersonalAccountOwner(owner)
+    }
+
     private func canonicalNames(_ names: [String]) -> [String] {
         var canonicalNamesByIdentifier = [String: String]()
         for name in names where !name.isEmpty {
@@ -551,7 +557,7 @@ struct SettingsView: View {
     }
 
     private func hasOwnerScope(_ owner: String) -> Bool {
-        isOrganizationOwner(owner) ? hasOrganizationScope(owner) : hasUserScope(owner)
+        hasOrganizationScope(owner) || hasUserScope(owner)
     }
 
     private func setOrganizationScope(_ organization: String, selected: Bool) {
@@ -579,10 +585,22 @@ struct SettingsView: View {
     }
 
     private func setOwnerScope(_ owner: String, selected: Bool) {
-        if isOrganizationOwner(owner) {
-            setOrganizationScope(owner, selected: selected)
+        guard selected else {
+            watchScopeDraft = Set(watchScopeDraft.filter { scope in
+                switch scope {
+                case let .org(selectedOwner), let .user(selectedOwner):
+                    return selectedOwner.caseInsensitiveCompare(owner) != .orderedSame
+                case .repo:
+                    return true
+                }
+            })
+            return
+        }
+
+        if isOrganizationOwner(owner) || hasOrganizationScope(owner) {
+            setOrganizationScope(owner, selected: true)
         } else {
-            setUserScope(owner, selected: selected)
+            setUserScope(owner, selected: true)
         }
     }
 
