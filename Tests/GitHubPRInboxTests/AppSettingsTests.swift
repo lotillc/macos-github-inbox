@@ -408,6 +408,7 @@ struct AppSettingsTests {
                 userLogin: "mona",
                 authorizedOwners: ["acme"],
                 accessibleRepositories: ["acme/backend"],
+                organizationOwners: ["acme"],
                 lastValidatedAt: nil
             )
         )
@@ -422,7 +423,7 @@ struct AppSettingsTests {
         }
         #expect(model.availableRepositoryNames == ["acme/backend"])
         #expect(model.availableRepositoryOwners == ["acme"])
-        #expect(model.availableOrganizationOwners.isEmpty)
+        #expect(model.availableOrganizationOwners == ["acme"])
         #expect(model.availablePersonalAccountOwners.isEmpty)
     }
 
@@ -486,6 +487,62 @@ struct AppSettingsTests {
 
         #expect(model.availableOrganizationOwners == ["acme"])
         #expect(model.availablePersonalAccountOwners.isEmpty)
+    }
+
+    @Test
+    func reconnectFailurePreservesAnExistingSignedInSession() async throws {
+        let tokenStore = testTokenStore(account: "reconnect-network-failure")
+        defer { try? tokenStore.deleteCredential() }
+        let settings = makeSettings(
+            account: "reconnect-network-failure",
+            tokenStore: tokenStore,
+            configuration: GitHubAuthConfiguration(clientID: "", appSlug: "", expectedOwners: [])
+        )
+        let session = makeSettingsMockSession { request in
+            let url = try #require(request.url)
+            guard (url.host, url.path) == ("github.com", "/login/device/code") else {
+                throw NSError(domain: "SettingsMockURLProtocol", code: 23)
+            }
+            return settingsJSONResponse(statusCode: 503, body: #"{ "message": "temporary failure" }"#)
+        }
+        let provider = GitHubAuthProvider(
+            configuration: settings.gitHubAppConfiguration,
+            session: session,
+            tokenStore: tokenStore
+        )
+        let model = InboxViewModel(settings: settings, authProvider: provider)
+        guard await waitForMissingConfiguration(in: model, timeout: 2) else {
+            Issue.record("The initial refresh did not finish with the intentionally missing configuration.")
+            return
+        }
+
+        _ = try settings.saveGitHubAppConfiguration(
+            clientID: "Iv1.test",
+            appSlug: "test-app",
+            expectedOwner: ""
+        )
+        try tokenStore.saveCredential(
+            GitHubCredential(
+                accessToken: "ghu_test",
+                refreshToken: "ghr_test",
+                accessTokenExpiresAt: Date().addingTimeInterval(60 * 60),
+                refreshTokenExpiresAt: Date().addingTimeInterval(60 * 60 * 24),
+                userID: 7,
+                userLogin: "mona",
+                authorizedOwners: [],
+                accessibleRepositories: [],
+                organizationOwners: [],
+                lastValidatedAt: Date()
+            )
+        )
+        await model.refreshAuthStatus()
+        #expect(model.authState.isAuthenticated)
+
+        await model.beginSignIn()
+
+        #expect(model.authState.isAuthenticated)
+        #expect(model.currentUser == GitHubUser(login: "mona"))
+        #expect(model.authStatusMessage?.contains("503") == true)
     }
 
     @Test

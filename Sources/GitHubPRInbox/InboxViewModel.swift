@@ -252,6 +252,16 @@ final class InboxViewModel: ObservableObject {
                 return
             }
 
+            if case .signedIn = authState,
+               let summary = lastKnownSessionSummary,
+               isTransientAuthenticationCheckError(error)
+            {
+                currentUser = summary.user
+                setAuthenticatedSession(summary)
+                authStatusMessage = error.localizedDescription
+                return
+            }
+
             mapAuthError(error)
         }
     }
@@ -409,6 +419,7 @@ final class InboxViewModel: ObservableObject {
             // Validate them before showing owner controls so organizations are
             // never misrepresented as personal accounts.
             let needsOwnerClassification = credential.organizationOwners == nil
+            hasOwnerClassification = !needsOwnerClassification
             let credentialSummary = GitHubSessionSummary(
                 user: GitHubUser(login: credential.userLogin),
                 tokenExpiresAt: credential.accessTokenExpiresAt,
