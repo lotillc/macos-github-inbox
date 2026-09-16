@@ -9,6 +9,9 @@ final class AppSettings: ObservableObject {
         static let refreshIntervalMinutes = "refreshIntervalMinutes"
         static let sortOption = "sortOption"
         static let launchAtLoginRequested = "launchAtLoginRequested"
+        static let gitHubAppClientID = "gitHubAppClientID"
+        static let gitHubAppSlug = "gitHubAppSlug"
+        static let gitHubAppExpectedOwner = "gitHubAppExpectedOwner"
     }
 
     @Published var allowlistText: String {
@@ -50,7 +53,11 @@ final class AppSettings: ObservableObject {
         }
     }
 
-    @Published private(set) var hasStoredToken: Bool
+    @Published private(set) var gitHubAppClientID: String
+    @Published private(set) var gitHubAppSlug: String
+    @Published private(set) var gitHubAppExpectedOwner: String
+
+    @Published private(set) var hasStoredCredentials: Bool
 
     static let defaultRefreshIntervalMinutes = 5
     static let supportedRefreshIntervals = [1, 5, 10, 15, 30, 60]
@@ -60,7 +67,8 @@ final class AppSettings: ObservableObject {
 
     init(
         userDefaults: UserDefaults = .standard,
-        tokenStore: KeychainTokenStore = .shared
+        tokenStore: KeychainTokenStore = .shared,
+        buildDefaultConfiguration: GitHubAuthConfiguration = .load()
     ) {
         self.userDefaults = userDefaults
         self.tokenStore = tokenStore
@@ -78,7 +86,30 @@ final class AppSettings: ObservableObject {
         sortOption = PullRequestSortOption(rawValue: storedSortOption) ?? .recentlyUpdatedFirst
 
         launchAtLoginRequested = userDefaults.bool(forKey: Keys.launchAtLoginRequested)
-        hasStoredToken = tokenStore.hasToken()
+        gitHubAppClientID = Self.persistedValue(
+            forKey: Keys.gitHubAppClientID,
+            userDefaults: userDefaults,
+            fallback: buildDefaultConfiguration.clientID
+        )
+        gitHubAppSlug = Self.persistedValue(
+            forKey: Keys.gitHubAppSlug,
+            userDefaults: userDefaults,
+            fallback: buildDefaultConfiguration.appSlug
+        )
+        gitHubAppExpectedOwner = Self.persistedValue(
+            forKey: Keys.gitHubAppExpectedOwner,
+            userDefaults: userDefaults,
+            fallback: buildDefaultConfiguration.expectedOwners.joined(separator: ", ")
+        )
+        hasStoredCredentials = tokenStore.hasCredentials()
+    }
+
+    var gitHubAppConfiguration: GitHubAuthConfiguration {
+        GitHubAuthConfiguration(
+            clientID: gitHubAppClientID,
+            appSlug: gitHubAppSlug,
+            expectedOwners: GitHubAuthConfiguration.expectedOwners(from: gitHubAppExpectedOwner)
+        )
     }
 
     var scopes: [RepositoryScope] {
@@ -102,7 +133,44 @@ final class AppSettings: ObservableObject {
         }
     }
 
-    func reloadTokenPresence() {
-        hasStoredToken = tokenStore.hasToken()
+    func reloadCredentialPresence() {
+        hasStoredCredentials = tokenStore.hasCredentials()
+    }
+
+    func saveGitHubAppConfiguration(
+        clientID: String,
+        appSlug: String,
+        expectedOwner: String
+    ) throws -> GitHubAuthConfiguration {
+        let configuration = GitHubAuthConfiguration(
+            clientID: clientID,
+            appSlug: appSlug,
+            expectedOwners: GitHubAuthConfiguration.expectedOwners(from: expectedOwner)
+        )
+
+        if let message = configuration.missingConfigurationMessage {
+            throw GitHubAuthError.missingConfiguration(message)
+        }
+
+        gitHubAppClientID = configuration.clientID
+        gitHubAppSlug = configuration.appSlug
+        gitHubAppExpectedOwner = configuration.expectedOwners.joined(separator: ", ")
+        userDefaults.set(gitHubAppClientID, forKey: Keys.gitHubAppClientID)
+        userDefaults.set(gitHubAppSlug, forKey: Keys.gitHubAppSlug)
+        userDefaults.set(gitHubAppExpectedOwner, forKey: Keys.gitHubAppExpectedOwner)
+        return configuration
+    }
+
+    private static func persistedValue(
+        forKey key: String,
+        userDefaults: UserDefaults,
+        fallback: String
+    ) -> String {
+        if let value = userDefaults.object(forKey: key) as? String {
+            return value
+        }
+
+        userDefaults.set(fallback, forKey: key)
+        return fallback
     }
 }

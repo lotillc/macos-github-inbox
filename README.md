@@ -11,7 +11,7 @@ It is built for people who live in GitHub all day and want a compact triage surf
 ## Features
 
 - Native `MenuBarExtra` UI
-- Fine-grained GitHub PAT stored in macOS Keychain
+- GitHub App device-flow sign-in stored in macOS Keychain
 - Review queue, authored queue, and workflow failure queue
 - CI status indicators on PR rows
 - New-item markers since last open
@@ -27,12 +27,88 @@ It is built for people who live in GitHub all day and want a compact triage surf
 
 - macOS 14+
 - Xcode 16+
-- A GitHub fine-grained personal access token with:
+- A GitHub App installed on the org or account that owns the repositories you want to watch
+- GitHub App permissions:
   - `Pull requests: Read`
   - `Commit statuses: Read`
-  - `Actions: Read` for workflow failure tracking
+  - `Checks: Read`
+  - `Actions: Read`
+- GitHub App configuration:
+  - Device flow enabled
+  - Client ID
+  - App slug
+- GitHub App configuration entered from the app's Settings screen:
+  - Client ID
+  - App slug
+  - Optional expected organizations
 
-Depending on how your org publishes CI, `Checks` access may also be relevant, but the app falls back to commit status data where possible.
+## How to use this in your organization
+
+This app uses a GitHub App's user-to-server OAuth device flow. It does **not** accept or store a
+personal access token (PAT), a GitHub App private key, or a client secret. Each employee signs in
+with their own GitHub account; GitHub limits the resulting token to the access shared by that user
+and the installed app.
+
+### 1. Create the organization GitHub App
+
+An organization owner (or GitHub App manager) should open **Organization settings → Developer
+settings → GitHub Apps → New GitHub App** and use these settings:
+
+| Setting | Value |
+| --- | --- |
+| App ownership and visibility | Create it under the organization; choose **Only on this account**. |
+| Callback URL | Leave blank. Device flow does not use a callback. |
+| Request user authorization during installation | Leave off. The desktop app performs user authorization through device flow. |
+| User authorization token expiration | Leave expiration enabled (the secure default). |
+| Enable Device Flow | Turn on. |
+| Webhooks | Disable; this app does not receive webhooks. |
+| Repository permissions | `Pull requests: Read`, `Commit statuses: Read`, `Checks: Read`, and `Actions: Read`. |
+
+Create the app, then copy its **Client ID** and **slug** from the app's settings page. The Client ID
+is public and is different from the App ID. Do not generate or distribute a private key or client
+secret: this desktop device flow does not need either.
+
+### 2. Install it on the right repositories
+
+From the app's settings, choose **Install App**, select your organization, then choose **Only select
+repositories**. Add exactly the repositories that employees should be able to watch. A user can see
+a repository in the inbox only when both conditions are true:
+
+1. The GitHub App installation includes that repository.
+2. The user has access to that repository in GitHub.
+
+When adding a new repository later, update the GitHub App installation first, then add the
+repository (or its organization) to the app's watch list.
+
+### 3. Configure and distribute the macOS app
+
+After installing the app, open **Settings** and enter the Client ID, app slug, and optional
+expected organization logins from step 1 (comma-separated when needed). These are public
+identifiers saved for the current macOS user, so changing GitHub Apps does not require rebuilding
+or redistributing the application. Expected organizations are recommended because they help
+identify a missing installation before a user tries to load their inbox.
+
+Managed/internal builds may still provide `GITHUB_APP_CLIENT_ID`, `GITHUB_APP_SLUG`, and optional
+`GITHUB_APP_EXPECTED_OWNERS` through build settings or the launch environment. The app uses those
+values only to prefill Settings on first launch; saved Settings values always take precedence.
+
+### 4. Employee sign-in and SAML SSO
+
+Employees open **Settings** in the menu-bar app, add the organization or repository scopes they
+want to watch, and select **Sign In with GitHub**. The app opens GitHub in the browser and copies a
+short verification code; completing that browser prompt connects the user's GitHub account.
+
+For organizations using SAML SSO, each user must start an active SSO session for the organization
+before connecting. If they connected before starting SSO, use the app's SSO recovery controls to
+open the organization SSO page, revoke the existing GitHub App authorization in GitHub, and
+reconnect. The user access token and its rotating refresh token are stored only in that user's
+macOS Keychain.
+
+**Sign Out** deletes the local Keychain credential and clears inbox data. For immediate GitHub-side
+revocation, users revoke the GitHub App authorization in GitHub; administrators remove the app
+installation or repository access from the organization.
+
+See GitHub's [GitHub App registration guide](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/registering-a-github-app) and [device-flow guide](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-user-access-token-for-a-github-app) for the current GitHub UI and policy details.
 
 ## Install
 
@@ -43,6 +119,19 @@ open GitHubPRInbox.xcodeproj
 ```
 
 Then run the `GitHubPRInbox` scheme on `My Mac`.
+
+On first launch, configure the Client ID and app slug from **Settings**. For managed development
+builds, you may instead set optional first-launch defaults in the target build settings or the shell
+that launches Xcode:
+
+```bash
+export GITHUB_APP_CLIENT_ID=Iv1.your_client_id
+export GITHUB_APP_SLUG=your-app-slug
+export GITHUB_APP_EXPECTED_OWNERS=acme
+open GitHubPRInbox.xcodeproj
+```
+
+Saved Settings values take precedence, so neither path requires a rebuild to switch GitHub Apps.
 
 ### From release
 

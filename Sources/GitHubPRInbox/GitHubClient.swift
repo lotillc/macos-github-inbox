@@ -8,16 +8,19 @@ enum GitHubClientError: LocalizedError {
     case missingToken
     case configuration(String)
     case unauthorized(String)
+    case rateLimited(String)
     case invalidResponse(String)
     case network(String)
 
     var errorDescription: String? {
         switch self {
         case .missingToken:
-            "Add a GitHub personal access token in Settings."
+            "Sign in with GitHub in Settings."
         case let .configuration(message):
             message
         case let .unauthorized(message):
+            message
+        case let .rateLimited(message):
             message
         case let .invalidResponse(message):
             message
@@ -110,7 +113,15 @@ actor GitHubClient {
     }
 
     private struct SearchResponse: Decodable {
+        let totalCount: Int
+        let incompleteResults: Bool?
         let items: [SearchItem]
+
+        enum CodingKeys: String, CodingKey {
+            case totalCount = "total_count"
+            case incompleteResults = "incomplete_results"
+            case items
+        }
     }
 
     private struct SearchItem: Decodable {
@@ -212,8 +223,11 @@ actor GitHubClient {
     }
 
     private let session: URLSession
-    private let tokenProvider: @Sendable () throws -> String
+    private let tokenProvider: @Sendable () async throws -> String
+    private let refreshTokenProvider: (@Sendable (String) async throws -> String)?
     private let decoder: JSONDecoder
+    private let accessibleRepositoryNames: [String]
+    private let ownerScopes: [RepositoryScope]
 
     private enum PullRequestReviewGateState {
         case awaitingApproval
@@ -223,14 +237,80 @@ actor GitHubClient {
 
     init(
         session: URLSession = .shared,
-        tokenProvider: @escaping @Sendable () throws -> String
+        tokenProvider: @escaping @Sendable () throws -> String,
+        accessibleRepositoryNames: [String] = [],
+        ownerScopes: [RepositoryScope] = []
+    ) {
+        self.init(
+            session: session,
+            tokenProvider: { try tokenProvider() },
+            refreshTokenProvider: nil,
+            accessibleRepositoryNames: accessibleRepositoryNames,
+            ownerScopes: ownerScopes
+        )
+    }
+
+    init(
+        session: URLSession = .shared,
+        tokenProvider: @escaping @Sendable () async throws -> String,
+        refreshTokenProvider: (@Sendable () async throws -> String)? = nil,
+        accessibleRepositoryNames: [String] = [],
+        ownerScopes: [RepositoryScope] = []
     ) {
         self.session = session
         self.tokenProvider = tokenProvider
+        if let refreshTokenProvider {
+            self.refreshTokenProvider = { _ in
+                try await refreshTokenProvider()
+            }
+        } else {
+            self.refreshTokenProvider = nil
+        }
+        self.accessibleRepositoryNames = accessibleRepositoryNames
+        self.ownerScopes = ownerScopes
 
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         self.decoder = decoder
+    }
+
+    init(
+        session: URLSession = .shared,
+        tokenProvider: @escaping @Sendable () async throws -> String,
+        refreshAfterUnauthorized: @escaping @Sendable (String) async throws -> String,
+        accessibleRepositoryNames: [String] = [],
+        ownerScopes: [RepositoryScope] = []
+    ) {
+        self.session = session
+        self.tokenProvider = tokenProvider
+        self.refreshTokenProvider = refreshAfterUnauthorized
+        self.accessibleRepositoryNames = accessibleRepositoryNames
+        self.ownerScopes = ownerScopes
+
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        self.decoder = decoder
+    }
+
+    init(
+        session: URLSession = .shared,
+        authProvider: GitHubAuthProvider,
+        scopes: [RepositoryScope],
+        accessibleRepositoryNames: [String] = [],
+        ownerScopes: [RepositoryScope] = []
+    ) {
+        self.init(
+            session: session,
+            tokenProvider: { try await authProvider.validAccessToken(expectedScopes: scopes) },
+            refreshAfterUnauthorized: { rejectedToken in
+                try await authProvider.refreshAfterUnauthorized(
+                    rejectedAccessToken: rejectedToken,
+                    expectedScopes: scopes
+                )
+            },
+            accessibleRepositoryNames: accessibleRepositoryNames,
+            ownerScopes: ownerScopes
+        )
     }
 
     func validateToken() async throws -> GitHubUser {
@@ -248,11 +328,21 @@ actor GitHubClient {
             throw GitHubClientError.configuration("Add at least one org or repo in Settings.")
         }
 
-        let queries = GitHubSearchQueryBuilder.buildQueries(baseQualifier: filter, scopes: scopes)
+        let plans: [GitHubSearchQueryPlan]
+        do {
+            plans = try GitHubSearchQueryBuilder.buildPlan(
+                baseQualifier: filter,
+                scopes: scopes,
+                accessibleRepositoryNames: accessibleRepositoryNames,
+                ownerScopes: ownerScopes
+            )
+        } catch let error as GitHubSearchQueryPlanError {
+            throw GitHubClientError.configuration(error.localizedDescription)
+        }
         var itemsByID: [String: PullRequestItem] = [:]
 
-        for query in queries {
-            let responseItems = try await fetchAllPages(for: query)
+        for plan in plans {
+            let responseItems = try await fetchItems(for: plan, baseQualifier: filter)
             for item in responseItems {
                 itemsByID[item.id] = item
             }
@@ -379,25 +469,99 @@ actor GitHubClient {
         return failures
     }
 
-    private func fetchAllPages(for query: String) async throws -> [PullRequestItem] {
+    private func fetchItems(
+        for plan: GitHubSearchQueryPlan,
+        baseQualifier: String
+    ) async throws -> [PullRequestItem] {
+        // A validated owner inventory can prove that this owner has no
+        // authorized non-archived repositories. Do not issue or interpret a
+        // broad owner search in that case: public results, caps, and
+        // incomplete responses are all outside the authorized scope.
+        if plan.allowedRepositoryNames?.isEmpty == true {
+            return []
+        }
+
+        let result = try await fetchAllPages(for: plan.query)
+        if result.incompleteResults == true {
+            guard !plan.fallbackQueries.isEmpty else {
+                throw GitHubClientError.network(
+                    "GitHub Search did not complete this query. Try refreshing again or narrow the repository selection."
+                )
+            }
+
+            var fallbackItems: [PullRequestItem] = []
+            for fallbackQuery in plan.fallbackQueries {
+                let fallbackResult = try await fetchAllPages(for: "\(baseQualifier) \(fallbackQuery)")
+                guard fallbackResult.incompleteResults != true else {
+                    throw GitHubClientError.network(
+                        "GitHub Search did not complete \(fallbackQuery). Try refreshing again."
+                    )
+                }
+                guard fallbackResult.totalCount <= 1_000 else {
+                    throw GitHubClientError.configuration(
+                        "GitHub Search has more than 1,000 matching pull requests in \(fallbackQuery). Narrow this repository selection to load a complete inbox."
+                    )
+                }
+                fallbackItems.append(contentsOf: fallbackResult.items)
+            }
+            return fallbackItems
+        }
+
+        if result.totalCount > 1_000 {
+            guard !plan.fallbackQueries.isEmpty else {
+                throw GitHubClientError.configuration(
+                    "GitHub Search has more than 1,000 matching pull requests for this owner. Select repositories individually to load a complete inbox."
+                )
+            }
+
+            var fallbackItems: [PullRequestItem] = []
+            for fallbackQuery in plan.fallbackQueries {
+                let fallbackResult = try await fetchAllPages(for: "\(baseQualifier) \(fallbackQuery)")
+                guard fallbackResult.incompleteResults != true else {
+                    throw GitHubClientError.network(
+                        "GitHub Search did not complete \(fallbackQuery). Try refreshing again."
+                    )
+                }
+                guard fallbackResult.totalCount <= 1_000 else {
+                    throw GitHubClientError.configuration(
+                        "GitHub Search has more than 1,000 matching pull requests in \(fallbackQuery). Narrow this repository selection to load a complete inbox."
+                    )
+                }
+                fallbackItems.append(contentsOf: fallbackResult.items)
+            }
+            return fallbackItems
+        }
+
+        guard let allowedRepositoryNames = plan.allowedRepositoryNames else {
+            return result.items
+        }
+        return result.items.filter { allowedRepositoryNames.contains($0.repositoryName.lowercased()) }
+    }
+
+    private func fetchAllPages(for query: String) async throws -> (items: [PullRequestItem], totalCount: Int, incompleteResults: Bool) {
         var page = 1
         var allItems: [PullRequestItem] = []
+        var totalCount = 0
+        var incompleteResults = false
 
         while true {
             let url = try makeSearchURL(query: query, page: page)
             let data = try await requestData(url: url)
             let response = try decode(SearchResponse.self, from: data)
+            totalCount = response.totalCount
+            incompleteResults = incompleteResults || response.incompleteResults == true
             let items = try response.items.map(convertSearchItem)
             allItems.append(contentsOf: items)
 
-            if response.items.count < 100 {
+            let maximumFetchableCount = min(totalCount, 1_000)
+            if response.items.count < 100 || allItems.count >= maximumFetchableCount || totalCount > 1_000 || incompleteResults {
                 break
             }
 
             page += 1
         }
 
-        return allItems
+        return (allItems, totalCount, incompleteResults)
     }
 
     private func fetchCIStatusSnapshotsGraphQL(for items: [PullRequestItem]) async throws -> [String: PullRequestStatusSnapshot] {
@@ -481,7 +645,7 @@ actor GitHubClient {
     }
 
     private func requestGraphQLData(query: String) async throws -> Data {
-        let token = try tokenProvider()
+        let token = try await tokenProvider()
         guard !token.isEmpty else {
             throw GitHubClientError.missingToken
         }
@@ -495,27 +659,14 @@ actor GitHubClient {
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
 
-        do {
-            let (data, response) = try await session.data(for: request)
-
-            guard let httpResponse = response as? HTTPURLResponse else {
-                throw GitHubClientError.invalidResponse("GitHub returned a non-HTTP GraphQL response.")
-            }
-
-            guard (200...299).contains(httpResponse.statusCode) else {
-                throw mapHTTPError(statusCode: httpResponse.statusCode, bodyData: data)
-            }
-
-            return data
-        } catch let error as GitHubClientError {
-            throw error
-        } catch {
-            throw GitHubClientError.network(error.localizedDescription)
-        }
+        return try await sendAuthenticatedRequest(
+            request,
+            invalidResponseMessage: "GitHub returned a non-HTTP GraphQL response."
+        )
     }
 
     private func requestData(url: URL) async throws -> Data {
-        let token = try tokenProvider()
+        let token = try await tokenProvider()
         guard !token.isEmpty else {
             throw GitHubClientError.missingToken
         }
@@ -525,19 +676,65 @@ actor GitHubClient {
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
 
+        return try await sendAuthenticatedRequest(
+            request,
+            invalidResponseMessage: "GitHub returned a non-HTTP response."
+        )
+    }
+
+    private func sendAuthenticatedRequest(
+        _ request: URLRequest,
+        invalidResponseMessage: String,
+        allowRetry: Bool = true
+    ) async throws -> Data {
         do {
             let (data, response) = try await session.data(for: request)
 
             guard let httpResponse = response as? HTTPURLResponse else {
-                throw GitHubClientError.invalidResponse("GitHub returned a non-HTTP response.")
+                throw GitHubClientError.invalidResponse(invalidResponseMessage)
             }
 
             guard (200...299).contains(httpResponse.statusCode) else {
-                throw mapHTTPError(statusCode: httpResponse.statusCode, bodyData: data)
+                if httpResponse.statusCode == 401,
+                   allowRetry,
+                   let refreshTokenProvider
+                {
+                    guard let authorization = request.value(forHTTPHeaderField: "Authorization"),
+                          authorization.hasPrefix("Bearer ")
+                    else {
+                        throw GitHubClientError.missingToken
+                    }
+                    let rejectedToken = String(authorization.dropFirst("Bearer ".count))
+                    guard !rejectedToken.isEmpty else {
+                        throw GitHubClientError.missingToken
+                    }
+                    let refreshedToken = try await refreshTokenProvider(rejectedToken)
+                    guard !refreshedToken.isEmpty else {
+                        throw GitHubClientError.missingToken
+                    }
+
+                    var retriedRequest = request
+                    retriedRequest.setValue("Bearer \(refreshedToken)", forHTTPHeaderField: "Authorization")
+                    return try await sendAuthenticatedRequest(
+                        retriedRequest,
+                        invalidResponseMessage: invalidResponseMessage,
+                        allowRetry: false
+                    )
+                }
+
+                let headers = httpResponse.allHeaderFields.reduce(into: [String: String]()) { result, header in
+                    result[String(describing: header.key).lowercased()] = String(describing: header.value)
+                }
+                throw mapHTTPError(statusCode: httpResponse.statusCode, bodyData: data, headers: headers)
             }
 
             return data
         } catch let error as GitHubClientError {
+            throw error
+        } catch let error as GitHubAuthError {
+            // A forced refresh can surface reconnect, rate-limit, or SSO
+            // recovery guidance. Preserve it so the view model can render the
+            // appropriate recovery action instead of reporting a network fault.
             throw error
         } catch {
             throw GitHubClientError.network(error.localizedDescription)
@@ -858,27 +1055,47 @@ actor GitHubClient {
         }
     }
 
-    private func mapHTTPError(statusCode: Int, bodyData: Data) -> GitHubClientError {
+    private func mapHTTPError(
+        statusCode: Int,
+        bodyData: Data,
+        headers: [String: String]
+    ) -> GitHubClientError {
         let apiError = try? decoder.decode(APIErrorResponse.self, from: bodyData)
         let message = apiError?.message ?? String(decoding: bodyData, as: UTF8.self)
 
         switch statusCode {
         case 401:
-            return .unauthorized("Your GitHub token is invalid or revoked.")
-        case 403:
+            return .unauthorized("Your GitHub authorization is invalid, expired, or revoked.")
+        case 403, 429:
             let normalizedMessage = message.lowercased()
+            if statusCode == 429 || isRateLimited(headers: headers, normalizedMessage: normalizedMessage) {
+                return .rateLimited(rateLimitMessage(headers: headers))
+            }
             if normalizedMessage.contains("saml") || normalizedMessage.contains("single sign-on") {
-                return .unauthorized("Your token needs SSO authorization for one or more selected repositories.")
+                return .unauthorized("Your GitHub authorization needs SSO for one or more selected repositories.")
             }
 
-            if normalizedMessage.contains("rate limit") {
-                return .unauthorized("GitHub rate limited this token. Wait a bit and refresh again.")
-            }
-
-            return .unauthorized(message.isEmpty ? "GitHub denied access to one or more selected repositories." : message)
+            return .configuration(message.isEmpty ? "GitHub denied access to one or more selected repositories." : message)
         default:
             return .invalidResponse("GitHub API error \(statusCode): \(message)")
         }
+    }
+
+    private func isRateLimited(headers: [String: String], normalizedMessage: String) -> Bool {
+        normalizedMessage.contains("rate limit")
+            || headers["x-ratelimit-remaining"] == "0"
+            || headers["retry-after"] != nil
+    }
+
+    private func rateLimitMessage(headers: [String: String]) -> String {
+        if let retryAfter = headers["retry-after"] {
+            return "GitHub rate limit reached. Try again in \(retryAfter) seconds."
+        }
+        if let resetValue = headers["x-ratelimit-reset"], let timestamp = TimeInterval(resetValue) {
+            let resetDate = Date(timeIntervalSince1970: timestamp)
+            return "GitHub rate limit reached. Try again after \(resetDate.formatted(date: .omitted, time: .shortened))."
+        }
+        return "GitHub rate limit reached. Try again shortly."
     }
 
     private func convertSearchItem(_ item: SearchItem) throws -> PullRequestItem {

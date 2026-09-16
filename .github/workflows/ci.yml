@@ -18,7 +18,7 @@ jobs:
         run: sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
 
       - name: Run Swift tests
-        run: swift test
+        run: swift test --no-parallel
 
       - name: Build app
         run: xcodebuild -project GitHubPRInbox.xcodeproj -scheme GitHubPRInbox -configuration Debug build

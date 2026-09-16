@@ -9,8 +9,12 @@ struct GitHubPRInboxApp: App {
 
     init() {
         let settings = AppSettings()
+        let authProvider = GitHubAuthProvider(configuration: settings.gitHubAppConfiguration)
         let launchAtLoginManager = LaunchAtLoginManager()
-        let inboxViewModel = InboxViewModel(settings: settings)
+        let inboxViewModel = InboxViewModel(
+            settings: settings,
+            authProvider: authProvider
+        )
 
         _settings = StateObject(wrappedValue: settings)
         _launchAtLoginManager = StateObject(wrappedValue: launchAtLoginManager)

@@ -20,7 +20,7 @@ enum AllowlistParser {
                 }
 
                 let scope = RepositoryScope.org(org)
-                if seen.insert(scope.qualifier).inserted {
+                if seen.insert(scope.qualifier.lowercased()).inserted {
                     scopes.append(scope)
                 }
                 continue
@@ -33,7 +33,20 @@ enum AllowlistParser {
                 }
 
                 let scope = RepositoryScope.repo(repo)
-                if seen.insert(scope.qualifier).inserted {
+                if seen.insert(scope.qualifier.lowercased()).inserted {
+                    scopes.append(scope)
+                }
+                continue
+            }
+
+            if normalized.hasPrefix("user:") {
+                let user = String(token.dropFirst(5)).trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !user.isEmpty else {
+                    continue
+                }
+
+                let scope = RepositoryScope.user(user)
+                if seen.insert(scope.qualifier.lowercased()).inserted {
                     scopes.append(scope)
                 }
                 continue
@@ -41,12 +54,12 @@ enum AllowlistParser {
 
             if isRepoScope(token) {
                 let scope = RepositoryScope.repo(token)
-                if seen.insert(scope.qualifier).inserted {
+                if seen.insert(scope.qualifier.lowercased()).inserted {
                     scopes.append(scope)
                 }
             } else {
                 let scope = RepositoryScope.org(token)
-                if seen.insert(scope.qualifier).inserted {
+                if seen.insert(scope.qualifier.lowercased()).inserted {
                     scopes.append(scope)
                 }
             }
