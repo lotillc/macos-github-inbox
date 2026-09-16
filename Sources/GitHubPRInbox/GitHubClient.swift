@@ -473,10 +473,18 @@ actor GitHubClient {
         for plan: GitHubSearchQueryPlan,
         baseQualifier: String
     ) async throws -> [PullRequestItem] {
+        // A validated owner inventory can prove that this owner has no
+        // authorized non-archived repositories. Do not issue or interpret a
+        // broad owner search in that case: public results, caps, and
+        // incomplete responses are all outside the authorized scope.
+        if plan.allowedRepositoryNames?.isEmpty == true {
+            return []
+        }
+
         let result = try await fetchAllPages(for: plan.query)
         if result.incompleteResults == true {
             guard !plan.fallbackQueries.isEmpty else {
-                throw GitHubClientError.configuration(
+                throw GitHubClientError.network(
                     "GitHub Search did not complete this query. Try refreshing again or narrow the repository selection."
                 )
             }
@@ -485,7 +493,7 @@ actor GitHubClient {
             for fallbackQuery in plan.fallbackQueries {
                 let fallbackResult = try await fetchAllPages(for: "\(baseQualifier) \(fallbackQuery)")
                 guard fallbackResult.incompleteResults != true else {
-                    throw GitHubClientError.configuration(
+                    throw GitHubClientError.network(
                         "GitHub Search did not complete \(fallbackQuery). Try refreshing again."
                     )
                 }
@@ -510,7 +518,7 @@ actor GitHubClient {
             for fallbackQuery in plan.fallbackQueries {
                 let fallbackResult = try await fetchAllPages(for: "\(baseQualifier) \(fallbackQuery)")
                 guard fallbackResult.incompleteResults != true else {
-                    throw GitHubClientError.configuration(
+                    throw GitHubClientError.network(
                         "GitHub Search did not complete \(fallbackQuery). Try refreshing again."
                     )
                 }

@@ -78,7 +78,13 @@ enum GitHubSearchQueryBuilder {
                 if ownerRepositories.count > 4_000 {
                     throw GitHubSearchQueryPlanError.ownerSearchScopeTooLarge(scope.ownerName)
                 }
-                allowedRepositories = ownerRepositories.isEmpty ? nil : ownerRepositories
+                // An owner scope supplied by the validated inventory proves
+                // that this set is complete. Its being empty means GitHub did
+                // not authorize any non-archived repositories for the owner,
+                // not that the owner-wide search is unrestricted.
+                allowedRepositories = ownerScopeByOwner[scope.ownerName.lowercased()] == nil
+                    ? nil
+                    : ownerRepositories
             }
             return [GitHubSearchQueryPlan(
                 query: "\(baseQualifier) \(scope.qualifier)",

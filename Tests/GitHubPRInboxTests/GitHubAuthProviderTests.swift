@@ -851,13 +851,39 @@ struct GitHubAuthProviderTests {
             _ = try await client.fetchOpenPullRequests(filter: "is:open is:pr", scopes: [.repo("acme/backend")])
             Issue.record("Expected incomplete direct search to be rejected.")
         } catch let error as GitHubClientError {
-            if case let .configuration(message) = error {
+            if case let .network(message) = error {
                 #expect(message.localizedCaseInsensitiveContains("did not complete"))
                 #expect(!message.contains("1,000"))
             } else {
-                Issue.record("Expected a completeness configuration error, received \(error).")
+                Issue.record("Expected a retryable incomplete-search error, received \(error).")
             }
         }
+    }
+
+    @Test
+    func skipsOwnerSearchWhenKnownInventoryIsEmpty() async throws {
+        let requests = LockedRequestCounter()
+        let session = makeMockSession { _ in
+            requests.increment()
+            return jsonResponse(
+                statusCode: 200,
+                body: #"{ "total_count": 1001, "incomplete_results": true, "items": [] }"#
+            )
+        }
+        let client = GitHubClient(
+            session: session,
+            tokenProvider: { "ghu_test" },
+            accessibleRepositoryNames: [],
+            ownerScopes: [.org("acme")]
+        )
+
+        let items = try await client.fetchOpenPullRequests(
+            filter: "is:open is:pr",
+            scopes: [.org("acme")]
+        )
+
+        #expect(items.isEmpty)
+        #expect(requests.value == 0)
     }
 
     @Test

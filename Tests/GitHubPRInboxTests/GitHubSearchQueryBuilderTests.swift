@@ -71,6 +71,19 @@ struct GitHubSearchQueryBuilderTests {
     }
 
     @Test
+    func keepsAnEmptyKnownOwnerInventoryRestrictive() throws {
+        let plans = try GitHubSearchQueryBuilder.buildPlan(
+            baseQualifier: "is:open is:pr",
+            scopes: [.org("acme")],
+            accessibleRepositoryNames: [],
+            ownerScopes: [.org("acme")]
+        )
+
+        #expect(plans.count == 1)
+        #expect(plans[0].allowedRepositoryNames == [])
+    }
+
+    @Test
     func rejectsFullOwnerScopeWhenInventoryExceedsSearchScopeLimit() {
         let repositories = (1...4_001).map { "acme/repo-\($0)" }
 
