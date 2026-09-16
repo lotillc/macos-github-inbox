@@ -113,7 +113,15 @@ actor GitHubClient {
     }
 
     private struct SearchResponse: Decodable {
+        let totalCount: Int
+        let incompleteResults: Bool?
         let items: [SearchItem]
+
+        enum CodingKeys: String, CodingKey {
+            case totalCount = "total_count"
+            case incompleteResults = "incomplete_results"
+            case items
+        }
     }
 
     private struct SearchItem: Decodable {
@@ -218,6 +226,8 @@ actor GitHubClient {
     private let tokenProvider: @Sendable () async throws -> String
     private let refreshTokenProvider: (@Sendable (String) async throws -> String)?
     private let decoder: JSONDecoder
+    private let accessibleRepositoryNames: [String]
+    private let ownerScopes: [RepositoryScope]
 
     private enum PullRequestReviewGateState {
         case awaitingApproval
@@ -227,19 +237,25 @@ actor GitHubClient {
 
     init(
         session: URLSession = .shared,
-        tokenProvider: @escaping @Sendable () throws -> String
+        tokenProvider: @escaping @Sendable () throws -> String,
+        accessibleRepositoryNames: [String] = [],
+        ownerScopes: [RepositoryScope] = []
     ) {
         self.init(
             session: session,
             tokenProvider: { try tokenProvider() },
-            refreshTokenProvider: nil
+            refreshTokenProvider: nil,
+            accessibleRepositoryNames: accessibleRepositoryNames,
+            ownerScopes: ownerScopes
         )
     }
 
     init(
         session: URLSession = .shared,
         tokenProvider: @escaping @Sendable () async throws -> String,
-        refreshTokenProvider: (@Sendable () async throws -> String)? = nil
+        refreshTokenProvider: (@Sendable () async throws -> String)? = nil,
+        accessibleRepositoryNames: [String] = [],
+        ownerScopes: [RepositoryScope] = []
     ) {
         self.session = session
         self.tokenProvider = tokenProvider
@@ -250,6 +266,8 @@ actor GitHubClient {
         } else {
             self.refreshTokenProvider = nil
         }
+        self.accessibleRepositoryNames = accessibleRepositoryNames
+        self.ownerScopes = ownerScopes
 
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
@@ -259,11 +277,15 @@ actor GitHubClient {
     init(
         session: URLSession = .shared,
         tokenProvider: @escaping @Sendable () async throws -> String,
-        refreshAfterUnauthorized: @escaping @Sendable (String) async throws -> String
+        refreshAfterUnauthorized: @escaping @Sendable (String) async throws -> String,
+        accessibleRepositoryNames: [String] = [],
+        ownerScopes: [RepositoryScope] = []
     ) {
         self.session = session
         self.tokenProvider = tokenProvider
         self.refreshTokenProvider = refreshAfterUnauthorized
+        self.accessibleRepositoryNames = accessibleRepositoryNames
+        self.ownerScopes = ownerScopes
 
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
@@ -273,7 +295,9 @@ actor GitHubClient {
     init(
         session: URLSession = .shared,
         authProvider: GitHubAuthProvider,
-        scopes: [RepositoryScope]
+        scopes: [RepositoryScope],
+        accessibleRepositoryNames: [String] = [],
+        ownerScopes: [RepositoryScope] = []
     ) {
         self.init(
             session: session,
@@ -283,7 +307,9 @@ actor GitHubClient {
                     rejectedAccessToken: rejectedToken,
                     expectedScopes: scopes
                 )
-            }
+            },
+            accessibleRepositoryNames: accessibleRepositoryNames,
+            ownerScopes: ownerScopes
         )
     }
 
@@ -302,11 +328,21 @@ actor GitHubClient {
             throw GitHubClientError.configuration("Add at least one org or repo in Settings.")
         }
 
-        let queries = GitHubSearchQueryBuilder.buildQueries(baseQualifier: filter, scopes: scopes)
+        let plans: [GitHubSearchQueryPlan]
+        do {
+            plans = try GitHubSearchQueryBuilder.buildPlan(
+                baseQualifier: filter,
+                scopes: scopes,
+                accessibleRepositoryNames: accessibleRepositoryNames,
+                ownerScopes: ownerScopes
+            )
+        } catch let error as GitHubSearchQueryPlanError {
+            throw GitHubClientError.configuration(error.localizedDescription)
+        }
         var itemsByID: [String: PullRequestItem] = [:]
 
-        for query in queries {
-            let responseItems = try await fetchAllPages(for: query)
+        for plan in plans {
+            let responseItems = try await fetchItems(for: plan, baseQualifier: filter)
             for item in responseItems {
                 itemsByID[item.id] = item
             }
@@ -433,25 +469,99 @@ actor GitHubClient {
         return failures
     }
 
-    private func fetchAllPages(for query: String) async throws -> [PullRequestItem] {
+    private func fetchItems(
+        for plan: GitHubSearchQueryPlan,
+        baseQualifier: String
+    ) async throws -> [PullRequestItem] {
+        // A validated owner inventory can prove that this owner has no
+        // authorized non-archived repositories. Do not issue or interpret a
+        // broad owner search in that case: public results, caps, and
+        // incomplete responses are all outside the authorized scope.
+        if plan.allowedRepositoryNames?.isEmpty == true {
+            return []
+        }
+
+        let result = try await fetchAllPages(for: plan.query)
+        if result.incompleteResults == true {
+            guard !plan.fallbackQueries.isEmpty else {
+                throw GitHubClientError.network(
+                    "GitHub Search did not complete this query. Try refreshing again or narrow the repository selection."
+                )
+            }
+
+            var fallbackItems: [PullRequestItem] = []
+            for fallbackQuery in plan.fallbackQueries {
+                let fallbackResult = try await fetchAllPages(for: "\(baseQualifier) \(fallbackQuery)")
+                guard fallbackResult.incompleteResults != true else {
+                    throw GitHubClientError.network(
+                        "GitHub Search did not complete \(fallbackQuery). Try refreshing again."
+                    )
+                }
+                guard fallbackResult.totalCount <= 1_000 else {
+                    throw GitHubClientError.configuration(
+                        "GitHub Search has more than 1,000 matching pull requests in \(fallbackQuery). Narrow this repository selection to load a complete inbox."
+                    )
+                }
+                fallbackItems.append(contentsOf: fallbackResult.items)
+            }
+            return fallbackItems
+        }
+
+        if result.totalCount > 1_000 {
+            guard !plan.fallbackQueries.isEmpty else {
+                throw GitHubClientError.configuration(
+                    "GitHub Search has more than 1,000 matching pull requests for this owner. Select repositories individually to load a complete inbox."
+                )
+            }
+
+            var fallbackItems: [PullRequestItem] = []
+            for fallbackQuery in plan.fallbackQueries {
+                let fallbackResult = try await fetchAllPages(for: "\(baseQualifier) \(fallbackQuery)")
+                guard fallbackResult.incompleteResults != true else {
+                    throw GitHubClientError.network(
+                        "GitHub Search did not complete \(fallbackQuery). Try refreshing again."
+                    )
+                }
+                guard fallbackResult.totalCount <= 1_000 else {
+                    throw GitHubClientError.configuration(
+                        "GitHub Search has more than 1,000 matching pull requests in \(fallbackQuery). Narrow this repository selection to load a complete inbox."
+                    )
+                }
+                fallbackItems.append(contentsOf: fallbackResult.items)
+            }
+            return fallbackItems
+        }
+
+        guard let allowedRepositoryNames = plan.allowedRepositoryNames else {
+            return result.items
+        }
+        return result.items.filter { allowedRepositoryNames.contains($0.repositoryName.lowercased()) }
+    }
+
+    private func fetchAllPages(for query: String) async throws -> (items: [PullRequestItem], totalCount: Int, incompleteResults: Bool) {
         var page = 1
         var allItems: [PullRequestItem] = []
+        var totalCount = 0
+        var incompleteResults = false
 
         while true {
             let url = try makeSearchURL(query: query, page: page)
             let data = try await requestData(url: url)
             let response = try decode(SearchResponse.self, from: data)
+            totalCount = response.totalCount
+            incompleteResults = incompleteResults || response.incompleteResults == true
             let items = try response.items.map(convertSearchItem)
             allItems.append(contentsOf: items)
 
-            if response.items.count < 100 {
+            let maximumFetchableCount = min(totalCount, 1_000)
+            if response.items.count < 100 || allItems.count >= maximumFetchableCount || totalCount > 1_000 || incompleteResults {
                 break
             }
 
             page += 1
         }
 
-        return allItems
+        return (allItems, totalCount, incompleteResults)
     }
 
     private func fetchCIStatusSnapshotsGraphQL(for items: [PullRequestItem]) async throws -> [String: PullRequestStatusSnapshot] {

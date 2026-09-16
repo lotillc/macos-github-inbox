@@ -802,7 +802,25 @@ final class InboxViewModel: ObservableObject {
     }
 
     private func makeClient(scopes: [RepositoryScope]) -> GitHubClient {
-        GitHubClient(session: clientSession, authProvider: authProvider, scopes: scopes)
+        let summary = repositoryInventorySummary
+        let ownerScopes: [RepositoryScope]
+        if hasOwnerClassification {
+            let organizationOwners = Set(summary?.organizationOwners.map { $0.lowercased() } ?? [])
+            ownerScopes = (summary?.authorizedOwners ?? []).map { owner in
+                organizationOwners.contains(owner.lowercased()) ? .org(owner) : .user(owner)
+            }
+        } else {
+            // A credential saved before account types were recorded cannot
+            // safely broaden an explicit repository into an owner query.
+            ownerScopes = []
+        }
+        return GitHubClient(
+            session: clientSession,
+            authProvider: authProvider,
+            scopes: scopes,
+            accessibleRepositoryNames: summary?.accessibleRepositories ?? [],
+            ownerScopes: ownerScopes
+        )
     }
 
     private func refreshCIStatusesForVisibleItems(connectionGeneration: UInt) async {

@@ -733,7 +733,7 @@ struct AppSettingsTests {
             case ("api.github.com", "/user"):
                 return settingsJSONResponse(statusCode: 200, body: #"{ "id": 7, "login": "mona" }"#)
             case ("api.github.com", "/search/issues"):
-                return settingsJSONResponse(statusCode: 200, body: #"{ "items": [] }"#)
+                return settingsJSONResponse(statusCode: 200, body: #"{ "total_count": 0, "items": [] }"#)
             case ("api.github.com", "/repos/acme/backend/actions/runs"):
                 return settingsJSONResponse(
                     statusCode: 200,
