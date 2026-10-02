@@ -845,6 +845,60 @@ struct AppSettingsTests {
     }
 
     @Test
+    func viewStatusFetchWaitsForModelRefreshAndReusesItsCache() async throws {
+        let tokenStore = testTokenStore(account: "status-overlap")
+        defer { try? tokenStore.deleteCredential() }
+        let settings = makeSettings(account: "status-overlap", tokenStore: tokenStore,
+                                    configuration: GitHubAuthConfiguration(clientID: "", appSlug: "", expectedOwners: []))
+        let graphRequests = LockedSettingsTestInt(0)
+        let session = makeSettingsMockSession { request in
+            let url = try #require(request.url)
+            switch url.path {
+            case "/user/installations":
+                return settingsJSONResponse(statusCode: 200, body: #"{"installations":[{"id":1,"account":{"login":"acme","type":"Organization"},"repository_selection":"selected"}]}"#)
+            case "/user/installations/1/repositories":
+                return settingsJSONResponse(statusCode: 200, body: #"{"repositories":[{"full_name":"acme/backend"}]}"#)
+            case "/user":
+                return settingsJSONResponse(statusCode: 200, body: #"{"id":7,"login":"mona"}"#)
+            case "/search/issues":
+                let query = url.query?.removingPercentEncoding ?? ""
+                if query.contains("review-requested") {
+                    return settingsJSONResponse(statusCode: 200, body: #"{"total_count":1,"items":[{"number":7,"title":"Test","html_url":"https://github.com/acme/backend/pull/7","repository_url":"https://api.github.com/repos/acme/backend","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","draft":false}]}"#)
+                }
+                return settingsJSONResponse(statusCode: 200, body: #"{"total_count":0,"items":[]}"#)
+            case "/graphql":
+                graphRequests.store(graphRequests.load() + 1)
+                Thread.sleep(forTimeInterval: 0.1)
+                return settingsJSONResponse(statusCode: 200, body: #"{"data":{"repo0":{"pr0_0":{"reviewDecision":"APPROVED","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","statusCheckRollup":{"state":"SUCCESS","contexts":{"nodes":[]}},"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}"#)
+            default:
+                return settingsJSONResponse(statusCode: 503, body: #"{"message":"Unexpected endpoint"}"#)
+            }
+        }
+        let provider = GitHubAuthProvider(configuration: settings.gitHubAppConfiguration, session: session, tokenStore: tokenStore)
+        let model = InboxViewModel(settings: settings, authProvider: provider, clientSession: session,
+                                   notificationDelivery: { _, _, _ in })
+        guard await waitForMissingConfiguration(in: model, timeout: 2) else {
+            Issue.record("Initial refresh did not finish.")
+            return
+        }
+        _ = try settings.saveGitHubAppConfiguration(clientID: "Iv1.test", appSlug: "test-app", expectedOwner: "")
+        try tokenStore.saveCredential(testCredential())
+        settings.allowlistText = "org:acme"
+        let refresh = Task { await model.refresh() }
+        let deadline = Date().addingTimeInterval(2)
+        while model.reviewRequests.isEmpty && Date() < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(model.isLoading)
+        #expect(model.lastRefreshAt == nil)
+        await model.refreshCIStatuses(for: model.reviewRequests, notifyFailures: false)
+        await refresh.value
+        #expect(graphRequests.load() == 1)
+        #expect(model.lastRefreshAt != nil)
+        #expect(model.statusSnapshot(for: try #require(model.reviewRequests.first))?.status == .readyToMerge)
+    }
+
+    @Test
     func ignoresUnexpandedBuildSettingPlaceholders() {
         let configuration = GitHubAuthConfiguration.load(
             environment: [:],

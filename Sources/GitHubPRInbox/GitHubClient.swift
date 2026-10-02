@@ -40,6 +40,10 @@ actor GitHubClient {
         let errors: [GraphQLErrorNode]?
     }
 
+    private struct GraphQLResponseErrors: Decodable {
+        let errors: [GraphQLErrorNode]?
+    }
+
     private struct GraphQLErrorNode: Decodable {
         let message: String
     }
@@ -402,34 +406,54 @@ actor GitHubClient {
     }
 
     func fetchCIStatusSnapshots(for items: [PullRequestItem]) async throws -> [String: PullRequestStatusSnapshot] {
-        guard !items.isEmpty else {
-            return [:]
+        var snapshots: [String: PullRequestStatusSnapshot] = [:]
+        let batchSize = 20
+        for start in stride(from: 0, to: items.count, by: batchSize) {
+            try Task.checkCancellation()
+            let batch = Array(items[start..<min(start + batchSize, items.count)])
+            do {
+                let result = try await fetchCIStatusSnapshotsGraphQL(for: batch)
+                snapshots.merge(result) { _, new in new }
+            } catch {
+                try Task.checkCancellation()
+                // Authentication and quota failures cannot be repaired by issuing more requests.
+                if error is GitHubAuthError { throw error }
+                if let clientError = error as? GitHubClientError {
+                    switch clientError {
+                    case .unauthorized, .rateLimited, .missingToken: throw error
+                    default: break
+                    }
+                }
+                let fallback = await fetchStatusFallback(for: batch)
+                try Task.checkCancellation()
+                if fallback.isEmpty && snapshots.isEmpty { throw error }
+                snapshots.merge(fallback) { _, new in new }
+                // At most one failed batch uses REST. Remaining rows stay unavailable
+                // until retry, avoiding an entire large queue's worth of fallback calls.
+                return snapshots
+            }
         }
+        return snapshots
+    }
 
-        do {
-            return try await fetchCIStatusSnapshotsGraphQL(for: items)
-        } catch {
+    private func fetchStatusFallback(for items: [PullRequestItem]) async -> [String: PullRequestStatusSnapshot] {
+        await withTaskGroup(of: (String, PullRequestStatusSnapshot?).self) { group in
+            var iterator = items.makeIterator()
             var snapshots: [String: PullRequestStatusSnapshot] = [:]
-
-            await withTaskGroup(of: (String, PullRequestStatusSnapshot?).self) { group in
-                for item in items {
-                    group.addTask {
-                        let snapshot = try? await self.fetchCIStatusSnapshot(for: item)
-                        return (item.id, snapshot)
-                    }
+            for _ in 0..<4 {
+                guard let item = iterator.next() else { break }
+                group.addTask { (item.id, try? await self.fetchCIStatusSnapshot(for: item)) }
+            }
+            for await (itemID, snapshot) in group {
+                if Task.isCancelled {
+                    group.cancelAll()
+                    break
                 }
-
-                for await (itemID, snapshot) in group {
-                    if let snapshot {
-                        snapshots[itemID] = snapshot
-                    }
+                if let snapshot { snapshots[itemID] = snapshot }
+                if let item = iterator.next() {
+                    group.addTask { (item.id, try? await self.fetchCIStatusSnapshot(for: item)) }
                 }
             }
-
-            if snapshots.isEmpty {
-                throw error
-            }
-
             return snapshots
         }
     }
@@ -783,6 +807,14 @@ actor GitHubClient {
                 throw mapHTTPError(statusCode: httpResponse.statusCode, bodyData: data, headers: headers)
             }
 
+            if request.url?.path == "/graphql",
+               let errors = (try? decoder.decode(GraphQLResponseErrors.self, from: data))?.errors,
+               !errors.isEmpty,
+               httpResponse.value(forHTTPHeaderField: "X-RateLimit-Remaining") == "0"
+                || httpResponse.value(forHTTPHeaderField: "Retry-After") != nil
+                || errors.contains(where: { $0.message.localizedCaseInsensitiveContains("rate limit") }) {
+                throw GitHubClientError.rateLimited(errors.map(\.message).joined(separator: "; "))
+            }
             return data
         } catch let error as GitHubClientError {
             throw error

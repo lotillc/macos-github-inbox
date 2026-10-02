@@ -322,7 +322,11 @@ struct InboxMenuView: View {
                 }
                 .accessibilityLabel("Search inbox")
             if !searchText.isEmpty {
-                Button { searchText = "" } label: { Image(systemName: "xmark.circle.fill") }
+                Button {
+                    searchText = ""
+                    isSearchFocused = false
+                    keyboardFocusRevision += 1
+                } label: { Image(systemName: "xmark.circle.fill") }
                     .buttonStyle(.borderless)
                     .help("Clear search")
                     .accessibilityLabel("Clear search")

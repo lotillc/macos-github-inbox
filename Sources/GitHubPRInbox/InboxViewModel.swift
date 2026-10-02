@@ -196,7 +196,6 @@ final class InboxViewModel: ObservableObject {
             authoredSource = authoredResults
             workflowFailureSource = workflowResults
             applySnapshot()
-            lastRefreshAt = Date()
             await updateWorkflowFailureAlerts(connectionGeneration: generation)
             guard isCurrentConnection(generation) else {
                 return
@@ -206,6 +205,7 @@ final class InboxViewModel: ObservableObject {
                 return
             }
 
+            lastRefreshAt = Date()
             if workflowMonitoringIsCapped {
                 statusMessage = "Workflow monitoring is limited to the first \(Self.maximumWorkflowRepositoryRequests) accessible repositories. Select specific repositories in Settings to monitor a different set."
             } else if reviewRequests.isEmpty && authoredPullRequests.isEmpty && workflowFailures.isEmpty {
@@ -656,7 +656,15 @@ final class InboxViewModel: ObservableObject {
     }
 
     func refreshCIStatuses(for items: [PullRequestItem], notifyFailures: Bool = false) async {
-        await refreshCIStatuses(for: items, connectionGeneration: connectionGeneration, notifyFailures: notifyFailures)
+        let generation = connectionGeneration
+        if isLoading {
+            for await loading in $isLoading.values {
+                guard !Task.isCancelled else { return }
+                if !loading { break }
+            }
+        }
+        guard isCurrentConnection(generation), !Task.isCancelled else { return }
+        await refreshCIStatuses(for: items, connectionGeneration: generation, notifyFailures: notifyFailures)
     }
 
     private func refreshCIStatuses(

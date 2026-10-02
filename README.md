@@ -235,3 +235,8 @@ failure notifications. Attention results retain the last fetched classification 
 refresh attempt; a failed attempt marks that classification unavailable until a successful
 retry. Picker changes, copy-link actions, and list controls restore keyboard navigation while
 search editing retains text focus.
+
+View-driven status checks wait for a model refresh to finish and reuse its status cache.
+Large queues use sequential GraphQL batches of 20 PRs. If a batch fails, REST fallback checks
+at most that batch, with four PRs in flight; remaining rows are reported as incomplete until
+retry. Authentication and rate-limit errors skip REST fallback.
