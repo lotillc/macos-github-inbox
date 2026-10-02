@@ -202,3 +202,18 @@ git push origin v0.1.0
 ```
 
 That will also publish an unsigned release artifact. If you want signed/notarized artifacts, add the required Apple credentials and signing steps to the release workflow or run notarization locally before upload.
+
+### Large inboxes
+
+Use the repository picker in the menu to narrow all three queues to one repository. Clear it
+with the adjacent × button. Queue counts reflect the selected repository. The sort picker
+supports last updated, oldest created, and PR number in either direction; PR numbers are scoped
+to each repository, so number sorting is most useful with a repository selected.
+
+PR rows show plain numbers, compact update ages (`4m`, `12h`, `2d`), and unresolved review-thread
+counts beside a speech bubble. A dash means the count is unavailable; zero means all fetched
+review threads are resolved. Thread counts include outdated threads that remain unresolved and
+exclude general PR conversation comments. Counts refresh with the existing PR status fetch.
+Hover over a row for its full title and repository. Select a repository to hide the repeated
+repository label and give titles more room. The link button copies the URL without opening it,
+then briefly shows a checkmark. The list scrolls within the menu; “Show more” has no 30-row cap.

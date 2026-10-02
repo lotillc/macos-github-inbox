@@ -65,6 +65,8 @@ enum PullRequestCIStatus: String, Codable, Equatable {
 enum PullRequestSortOption: String, CaseIterable, Identifiable {
     case recentlyUpdatedFirst
     case oldestFirst
+    case highestNumberFirst
+    case lowestNumberFirst
 
     var id: String {
         rawValue
@@ -76,6 +78,10 @@ enum PullRequestSortOption: String, CaseIterable, Identifiable {
             "Recently Updated First"
         case .oldestFirst:
             "Oldest First"
+        case .highestNumberFirst:
+            "PR Number ↓"
+        case .lowestNumberFirst:
+            "PR Number ↑"
         }
     }
 }
@@ -139,6 +145,7 @@ struct PullRequestItem: Identifiable, Hashable {
 struct PullRequestStatusSnapshot: Equatable {
     let status: PullRequestCIStatus
     let debugSummary: String
+    var unresolvedThreadCount: Int? = nil
 }
 
 struct WorkflowFailureItem: Identifiable, Hashable {
@@ -212,21 +219,24 @@ enum PullRequestStore {
             }
         }
 
-        return uniqueByID.values.sorted { lhs, rhs in
+        return sorted(Array(uniqueByID.values), sortOption: sortOption)
+    }
+
+    static func sorted(_ items: [PullRequestItem], sortOption: PullRequestSortOption) -> [PullRequestItem] {
+        items.sorted { lhs, rhs in
             switch sortOption {
             case .recentlyUpdatedFirst:
-                if lhs.updatedAt == rhs.updatedAt {
-                    return lhs.createdAt > rhs.createdAt
-                }
-
-                return lhs.updatedAt > rhs.updatedAt
+                if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt > rhs.updatedAt }
+                if lhs.createdAt != rhs.createdAt { return lhs.createdAt > rhs.createdAt }
             case .oldestFirst:
-                if lhs.createdAt == rhs.createdAt {
-                    return lhs.updatedAt < rhs.updatedAt
-                }
-
-                return lhs.createdAt < rhs.createdAt
+                if lhs.createdAt != rhs.createdAt { return lhs.createdAt < rhs.createdAt }
+                if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt < rhs.updatedAt }
+            case .highestNumberFirst:
+                if lhs.number != rhs.number { return lhs.number > rhs.number }
+            case .lowestNumberFirst:
+                if lhs.number != rhs.number { return lhs.number < rhs.number }
             }
+            return lhs.id < rhs.id
         }
     }
 }

@@ -54,10 +54,25 @@ actor GitHubClient {
     }
 
     private struct GraphQLPullRequestNode: Decodable {
+        let reviewThreads: GraphQLReviewThreadConnection?
         let reviewDecision: String?
         let mergeable: String?
         let mergeStateStatus: String?
         let statusCheckRollup: GraphQLStatusCheckRollup?
+    }
+
+    private struct GraphQLReviewThreadConnection: Decodable {
+        let nodes: [GraphQLReviewThread?]
+        let pageInfo: GraphQLPageInfo
+    }
+
+    private struct GraphQLReviewThread: Decodable {
+        let isResolved: Bool
+    }
+
+    private struct GraphQLPageInfo: Decodable {
+        let hasNextPage: Bool
+        let endCursor: String?
     }
 
     private struct GraphQLStatusCheckRollup: Decodable {
@@ -623,7 +638,7 @@ actor GitHubClient {
                 }
             } ?? []
 
-            let snapshot = mergeCIState(
+            var snapshot = mergeCIState(
                 combinedStatus: rollup.map {
                     CombinedStatusResponse(
                         state: ($0.state ?? "none").lowercased(),
@@ -638,10 +653,50 @@ actor GitHubClient {
                 mergeable: mergeable,
                 mergeStateStatus: mergeStateStatus
             )
+            if let threads = pullRequestNode?.reviewThreads {
+                // Thread failures must not discard a successfully fetched CI status.
+                snapshot.unresolvedThreadCount = try? await unresolvedThreadCount(for: item, firstPage: threads)
+            }
             snapshots[item.id] = snapshot
         }
 
         return snapshots
+    }
+
+    private func unresolvedThreadCount(
+        for item: PullRequestItem,
+        firstPage: GraphQLReviewThreadConnection
+    ) async throws -> Int {
+        var page = firstPage
+        var count = 0
+        var visitedCursors = Set<String>()
+        let components = item.repositoryName.split(separator: "/", maxSplits: 1).map(String.init)
+        while true {
+            count += page.nodes.compactMap { $0 }.filter { !$0.isResolved }.count
+            guard page.pageInfo.hasNextPage else { return count }
+            guard let cursor = page.pageInfo.endCursor, visitedCursors.insert(cursor).inserted else {
+                throw GitHubClientError.invalidResponse("GitHub returned an invalid review-thread cursor.")
+            }
+            let query = """
+            query ReviewThreads {
+              repo: repository(owner: "\(escapeGraphQLString(components[0]))", name: "\(escapeGraphQLString(components[1]))") {
+                pr: pullRequest(number: \(item.number)) {
+                  reviewThreads(first: 100, after: "\(escapeGraphQLString(cursor))") {
+                    nodes { isResolved }
+                    pageInfo { hasNextPage endCursor }
+                  }
+                }
+              }
+            }
+            """
+            let data = try await requestGraphQLData(query: query)
+            let envelope = try decode(GraphQLResponseEnvelope.self, from: data)
+            guard envelope.errors?.isEmpty != false,
+                  let nextPage = envelope.data?["repo"]?.rawPullRequests["pr"]?.reviewThreads else {
+                throw GitHubClientError.invalidResponse("Could not load all review threads.")
+            }
+            page = nextPage
+        }
     }
 
     private func requestGraphQLData(query: String) async throws -> Data {
@@ -774,6 +829,10 @@ actor GitHubClient {
                 pullRequestAliasByItemID[item.id] = pullRequestAlias
                 pullRequestBlocks.append("""
                 \(pullRequestAlias): pullRequest(number: \(item.number)) {
+                  reviewThreads(first: 100) {
+                    nodes { isResolved }
+                    pageInfo { hasNextPage endCursor }
+                  }
                   reviewDecision
                   mergeable
                   mergeStateStatus
