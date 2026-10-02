@@ -769,6 +769,55 @@ struct AppSettingsTests {
     }
 
     @Test
+    func expiredCleanStatusIsIncompleteAfterRefreshFails() async throws {
+        let tokenStore = testTokenStore(account: "attention-refresh-outage")
+        defer { try? tokenStore.deleteCredential() }
+        let settings = makeSettings(account: "attention-refresh-outage", tokenStore: tokenStore,
+                                    configuration: GitHubAuthConfiguration(clientID: "", appSlug: "", expectedOwners: []))
+        let clock = LockedSettingsTestInt(1_000)
+        let failStatus = LockedSettingsTestInt(0)
+        let session = makeSettingsMockSession { request in
+            let url = try #require(request.url)
+            switch url.path {
+            case "/user/installations":
+                return settingsJSONResponse(statusCode: 200, body: #"{"installations":[{"id":1,"account":{"login":"acme","type":"Organization"},"repository_selection":"selected"}]}"#)
+            case "/user/installations/1/repositories":
+                return settingsJSONResponse(statusCode: 200, body: #"{"repositories":[{"full_name":"acme/backend"}]}"#)
+            case "/user":
+                return settingsJSONResponse(statusCode: 200, body: #"{"id":7,"login":"mona"}"#)
+            case "/search/issues":
+                return settingsJSONResponse(statusCode: 200, body: #"{"total_count":0,"items":[]}"#)
+            case "/graphql" where failStatus.load() == 0:
+                return settingsJSONResponse(statusCode: 200, body: #"{"data":{"repo0":{"pr0_0":{"reviewDecision":"APPROVED","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","statusCheckRollup":{"state":"SUCCESS","contexts":{"nodes":[]}},"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}"#)
+            default:
+                return settingsJSONResponse(statusCode: 503, body: #"{"message":"temporary outage"}"#)
+            }
+        }
+        let provider = GitHubAuthProvider(configuration: settings.gitHubAppConfiguration, session: session, tokenStore: tokenStore)
+        let model = InboxViewModel(settings: settings, authProvider: provider, clientSession: session,
+                                   statusClock: { Date(timeIntervalSince1970: Double(clock.load())) })
+        guard await waitForMissingConfiguration(in: model, timeout: 2) else {
+            Issue.record("Initial refresh did not finish.")
+            return
+        }
+        _ = try settings.saveGitHubAppConfiguration(clientID: "Iv1.test", appSlug: "test-app", expectedOwner: "")
+        try tokenStore.saveCredential(testCredential())
+        settings.allowlistText = "org:acme"
+        await model.refresh()
+        #expect(model.authState.isAuthenticated)
+        let item = PullRequestItem(id: "acme/backend#7", repositoryName: "acme/backend", number: 7,
+                                   title: "Test", url: URL(string: "https://github.com/acme/backend/pull/7")!,
+                                   createdAt: .now, updatedAt: .now, isDraft: false)
+        await model.refreshCIStatuses(for: [item])
+        #expect(model.statusSnapshot(for: item)?.hasIncompleteAttentionStatus == false)
+        clock.store(1_061)
+        failStatus.store(1)
+        await model.refreshCIStatuses(for: [item])
+        #expect(model.statusSnapshot(for: item) == nil)
+        #expect(model.statusSnapshot(for: item)?.hasIncompleteAttentionStatus != false)
+    }
+
+    @Test
     func ignoresUnexpandedBuildSettingPlaceholders() {
         let configuration = GitHubAuthConfiguration.load(
             environment: [:],

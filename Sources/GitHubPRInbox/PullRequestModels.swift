@@ -240,3 +240,41 @@ enum PullRequestStore {
         }
     }
 }
+
+struct InboxListFilter: Equatable {
+    var searchText = ""
+    var repository = ""
+    var needsAttentionOnly = false
+
+    func matches(_ item: PullRequestItem) -> Bool {
+        guard repository.isEmpty || item.repositoryName == repository else { return false }
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return true }
+        let numberQuery = query.hasPrefix("#") ? String(query.dropFirst()) : query
+        return item.title.localizedStandardContains(query)
+            || item.repositoryName.localizedStandardContains(query)
+            || Int(numberQuery.replacingOccurrences(of: ",", with: "")) == item.number
+    }
+
+    func matches(_ item: WorkflowFailureItem) -> Bool {
+        guard repository.isEmpty || item.repositoryName == repository else { return false }
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        return query.isEmpty || item.workflowName.localizedStandardContains(query)
+            || item.repositoryName.localizedStandardContains(query)
+            || item.branchName?.localizedStandardContains(query) == true
+    }
+
+    func includes(status: PullRequestStatusSnapshot?) -> Bool {
+        !needsAttentionOnly || status?.needsAttention == true
+    }
+}
+
+extension PullRequestStatusSnapshot {
+    var needsAttention: Bool {
+        status == .failure || status == .conflicted || (unresolvedThreadCount ?? 0) > 0
+    }
+
+    var hasIncompleteAttentionStatus: Bool {
+        status == .unknown || unresolvedThreadCount == nil
+    }
+}

@@ -80,6 +80,10 @@ struct InboxMenuView: View {
     @ObservedObject var settings: AppSettings
     let openSettings: () -> Void
 
+    @State private var searchText = ""
+    @State private var needsAttentionOnly = false
+    @State private var isCheckingAttention = false
+    @FocusState private var isSearchFocused: Bool
     @State private var selectedRepository = ""
     @State private var copiedRowID: String?
     @State private var selectedSection: InboxSection = .reviewRequests
@@ -99,6 +103,7 @@ struct InboxMenuView: View {
             } else {
                 sectionPicker
                 listControls
+                searchControls
                 contentArea
             }
         }
@@ -108,6 +113,8 @@ struct InboxMenuView: View {
         .background(MenuWindowContentFitter(fitKey: menuSizingKey))
         .background(
             KeyboardEventBridge(
+                handlesKeyboard: !isSearchFocused,
+                onSearch: { isSearchFocused = true },
                 onLeftArrow: selectPreviousSection,
                 onRightArrow: selectNextSection,
                 onUpArrow: moveHighlightUp,
@@ -119,10 +126,28 @@ struct InboxMenuView: View {
                 onSectionThree: { selectedSection = .workflowFailures }
             )
         )
-        .task(id: visibleCITaskKey) {
-            await model.refreshCIStatuses(for: visiblePullRequestsForCurrentSection())
+        .task(id: statusTaskKey) {
+            isCheckingAttention = needsAttentionOnly && selectedSection != .workflowFailures
+            if !searchText.isEmpty {
+                do { try await Task.sleep(for: .milliseconds(250)) } catch { return }
+            }
+            await model.refreshCIStatuses(for: statusRefreshCandidates)
+            guard !Task.isCancelled else { return }
+            isCheckingAttention = false
+            ensureHighlightedRowIsValid()
         }
         .onAppear {
+            ensureHighlightedRowIsValid()
+        }
+        .onChange(of: searchText) { _, _ in
+            visibleRowLimitBySection = [:]
+            ensureHighlightedRowIsValid()
+        }
+        .onChange(of: needsAttentionOnly) { _, _ in
+            visibleRowLimitBySection = [:]
+            ensureHighlightedRowIsValid()
+        }
+        .onChange(of: currentSelectableRows().map(\.id)) { _, _ in
             ensureHighlightedRowIsValid()
         }
         .onChange(of: selectedRepository) { _, _ in
@@ -269,6 +294,61 @@ struct InboxMenuView: View {
         .controlSize(.small)
     }
 
+    private var listFilter: InboxListFilter {
+        InboxListFilter(searchText: searchText, repository: selectedRepository, needsAttentionOnly: needsAttentionOnly)
+    }
+
+    private var searchControls: some View {
+        HStack(spacing: 8) {
+            Button { isSearchFocused = true } label: {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.borderless)
+            .keyboardShortcut("f", modifiers: .command)
+            .help("Search inbox (⌘F)")
+            .accessibilityLabel("Focus search")
+            TextField("Search title, PR number, or repository", text: $searchText)
+                .textFieldStyle(.plain)
+                .focused($isSearchFocused)
+                .onSubmit { isSearchFocused = false }
+                .onExitCommand {
+                    searchText = ""
+                    isSearchFocused = false
+                }
+                .accessibilityLabel("Search inbox")
+            if !searchText.isEmpty {
+                Button { searchText = "" } label: { Image(systemName: "xmark.circle.fill") }
+                    .buttonStyle(.borderless)
+                    .help("Clear search")
+                    .accessibilityLabel("Clear search")
+            }
+            if selectedSection != .workflowFailures {
+                Toggle("Needs attention", isOn: $needsAttentionOnly)
+                    .toggleStyle(.button)
+                    .help("Show failed checks, merge conflicts, or unresolved review threads")
+            }
+        }
+        .font(.caption)
+        .padding(8)
+        .background(.quaternary.opacity(0.5))
+        .clipShape(RoundedRectangle(cornerRadius: 7))
+    }
+
+    private var attentionCandidates: [PullRequestItem] {
+        let items: [PullRequestItem]
+        switch selectedSection {
+        case .reviewRequests: items = model.reviewRequests
+        case .authoredPullRequests: items = model.authoredPullRequests
+        case .workflowFailures: items = []
+        }
+        return PullRequestStore.sorted(items.filter { listFilter.matches($0) }, sortOption: settings.sortOption)
+    }
+
+    private var incompleteAttentionCount: Int {
+        attentionCandidates.filter { model.statusSnapshot(for: $0)?.hasIncompleteAttentionStatus != false }.count
+    }
+
     private var onboardingSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Finish Setup")
@@ -319,7 +399,7 @@ struct InboxMenuView: View {
 
         return VStack(alignment: .leading, spacing: 8) {
             if currentCount == 0 {
-                Text(sectionContent.emptyText)
+                Text(emptyResultText(defaultText: sectionContent.emptyText))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .padding(.vertical, 6)
@@ -342,6 +422,18 @@ struct InboxMenuView: View {
                 Text("Showing \(visibleCount) of \(currentCount)")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
+            }
+
+            if needsAttentionOnly && selectedSection != .workflowFailures {
+                if isCheckingAttention {
+                    Text("Checking status across \(attentionCandidates.count) matching PRs…")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                } else if incompleteAttentionCount > 0 {
+                    Text("Status unavailable or incomplete for \(incompleteAttentionCount) PRs. Refresh to retry.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             if currentCount > visibleCount {
@@ -415,6 +507,15 @@ struct InboxMenuView: View {
         }
     }
 
+    private func emptyResultText(defaultText: String) -> String {
+        if needsAttentionOnly && selectedSection != .workflowFailures {
+            if isCheckingAttention { return "Checking for PRs that need attention…" }
+            return incompleteAttentionCount > 0 ? "No known PRs needing attention." : "No PRs need attention."
+        }
+        return searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? defaultText : "No results match your search."
+    }
+
     private func currentSectionContent() -> (
         items: [PullRequestItem],
         emptyText: String
@@ -475,9 +576,13 @@ struct InboxMenuView: View {
         return "Show \(nextCount - visibleCount) more"
     }
 
-    private var visibleCITaskKey: String {
-        let ids = visiblePullRequestsForCurrentSection().map(\.id).joined(separator: ",")
-        return "\(selectedSection.rawValue)|\(ids)|\(visiblePullRequestsForCurrentSection().map { $0.updatedAt.timeIntervalSince1970 })"
+    private var statusRefreshCandidates: [PullRequestItem] {
+        needsAttentionOnly ? attentionCandidates : visiblePullRequestsForCurrentSection()
+    }
+
+    private var statusTaskKey: String {
+        let candidates = statusRefreshCandidates
+        return "\(selectedSection.rawValue)|\(needsAttentionOnly)|\(selectedRepository)|\(searchText)|\(model.lastRefreshAt?.timeIntervalSince1970 ?? 0)|\(candidates.map { "\($0.id):\($0.updatedAt.timeIntervalSince1970)" }.joined(separator: ","))"
     }
 
     private var menuSizingKey: String {
@@ -617,13 +722,13 @@ struct InboxMenuView: View {
 
     private func sortedPullRequests(_ items: [PullRequestItem]) -> [PullRequestItem] {
         PullRequestStore.sorted(
-            items.filter { selectedRepository.isEmpty || $0.repositoryName == selectedRepository },
+            items.filter { listFilter.matches($0) && listFilter.includes(status: model.statusSnapshot(for: $0)) },
             sortOption: settings.sortOption
         )
     }
 
     private func prioritizedWorkflowFailures(_ items: [WorkflowFailureItem]) -> [WorkflowFailureItem] {
-        items.filter { selectedRepository.isEmpty || $0.repositoryName == selectedRepository }.sorted { lhs, rhs in
+        items.filter { listFilter.matches($0) }.sorted { lhs, rhs in
             let lhsIsNew = model.newlyWorkflowFailureIDs.contains(lhs.id)
             let rhsIsNew = model.newlyWorkflowFailureIDs.contains(rhs.id)
 
@@ -920,6 +1025,8 @@ final class MenuWindowContentFittingView: NSView {
 }
 
 private struct KeyboardEventBridge: NSViewRepresentable {
+    let handlesKeyboard: Bool
+    let onSearch: () -> Void
     let onLeftArrow: () -> Void
     let onRightArrow: () -> Void
     let onUpArrow: () -> Void
@@ -932,6 +1039,8 @@ private struct KeyboardEventBridge: NSViewRepresentable {
 
     func makeNSView(context: Context) -> KeyHandlingView {
         let view = KeyHandlingView()
+        view.handlesKeyboard = handlesKeyboard
+        view.onSearch = onSearch
         view.onLeftArrow = onLeftArrow
         view.onRightArrow = onRightArrow
         view.onUpArrow = onUpArrow
@@ -942,12 +1051,15 @@ private struct KeyboardEventBridge: NSViewRepresentable {
         view.onSectionTwo = onSectionTwo
         view.onSectionThree = onSectionThree
         DispatchQueue.main.async {
-            view.window?.makeFirstResponder(view)
+            if view.handlesKeyboard { view.window?.makeFirstResponder(view) }
         }
         return view
     }
 
     func updateNSView(_ nsView: KeyHandlingView, context: Context) {
+        let shouldRestoreFocus = handlesKeyboard && !nsView.handlesKeyboard
+        nsView.handlesKeyboard = handlesKeyboard
+        nsView.onSearch = onSearch
         nsView.onLeftArrow = onLeftArrow
         nsView.onRightArrow = onRightArrow
         nsView.onUpArrow = onUpArrow
@@ -957,13 +1069,17 @@ private struct KeyboardEventBridge: NSViewRepresentable {
         nsView.onSectionOne = onSectionOne
         nsView.onSectionTwo = onSectionTwo
         nsView.onSectionThree = onSectionThree
-        DispatchQueue.main.async {
-            nsView.window?.makeFirstResponder(nsView)
+        if shouldRestoreFocus {
+            DispatchQueue.main.async {
+                if nsView.handlesKeyboard { nsView.window?.makeFirstResponder(nsView) }
+            }
         }
     }
 }
 
 private final class KeyHandlingView: NSView {
+    var handlesKeyboard = true
+    var onSearch: (() -> Void)?
     var onLeftArrow: (() -> Void)?
     var onRightArrow: (() -> Void)?
     var onUpArrow: (() -> Void)?
@@ -979,6 +1095,14 @@ private final class KeyHandlingView: NSView {
     }
 
     override func keyDown(with event: NSEvent) {
+        guard handlesKeyboard else {
+            super.keyDown(with: event)
+            return
+        }
+        if event.modifierFlags.contains(.command), event.charactersIgnoringModifiers?.lowercased() == "f" {
+            onSearch?()
+            return
+        }
         if let characters = event.charactersIgnoringModifiers?.lowercased() {
             switch characters {
             case "j":

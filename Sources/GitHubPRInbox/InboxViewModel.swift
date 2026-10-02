@@ -24,6 +24,7 @@ final class InboxViewModel: ObservableObject {
     private let settings: AppSettings
     private let authProvider: GitHubAuthProvider
     private let clientSession: URLSession
+    private let statusClock: @Sendable () -> Date
     private var lastKnownSessionSummary: GitHubSessionSummary?
     private var hasOwnerClassification = false
     private var authoredSource: [PullRequestItem] = []
@@ -53,11 +54,13 @@ final class InboxViewModel: ObservableObject {
     init(
         settings: AppSettings,
         authProvider: GitHubAuthProvider = GitHubAuthProvider(),
-        clientSession: URLSession = .shared
+        clientSession: URLSession = .shared,
+        statusClock: @escaping @Sendable () -> Date = { .now }
     ) {
         self.settings = settings
         self.authProvider = authProvider
         self.clientSession = clientSession
+        self.statusClock = statusClock
 
         bindSettings()
         configureRefreshTimer(minutes: settings.refreshIntervalMinutes)
@@ -619,6 +622,12 @@ final class InboxViewModel: ObservableObject {
         ciStatusesByPullRequestID[item.id] ?? .unknown
     }
 
+    func statusSnapshot(for item: PullRequestItem) -> PullRequestStatusSnapshot? {
+        guard let cached = ciStatusCache[item.id], cached.updatedAt == item.updatedAt,
+              statusClock().timeIntervalSince(cached.fetchedAt) < 60 else { return nil }
+        return cached.snapshot
+    }
+
     func unresolvedThreadCount(for item: PullRequestItem) -> Int? {
         guard let cached = ciStatusCache[item.id], cached.updatedAt == item.updatedAt else { return nil }
         return cached.snapshot.unresolvedThreadCount
@@ -648,7 +657,7 @@ final class InboxViewModel: ObservableObject {
         for items: [PullRequestItem],
         connectionGeneration: UInt
     ) async {
-        guard authState.isAuthenticated else {
+        guard authState.isAuthenticated, !Task.isCancelled else {
             return
         }
 
@@ -659,7 +668,7 @@ final class InboxViewModel: ObservableObject {
 
             return cached.updatedAt != item.updatedAt
                 || cached.snapshot.unresolvedThreadCount == nil
-                || Date().timeIntervalSince(cached.fetchedAt) >= 60
+                || statusClock().timeIntervalSince(cached.fetchedAt) >= 60
         }
 
         guard !uncachedItems.isEmpty else {
@@ -676,13 +685,13 @@ final class InboxViewModel: ObservableObject {
         do {
             let snapshotsByItemID = try await client.fetchCIStatusSnapshots(for: uncachedItems)
 
-            guard isCurrentConnection(connectionGeneration) else {
+            guard isCurrentConnection(connectionGeneration), !Task.isCancelled else {
                 return
             }
 
             for item in uncachedItems {
                 if let snapshot = snapshotsByItemID[item.id] {
-                    ciStatusCache[item.id] = (updatedAt: item.updatedAt, fetchedAt: .now, snapshot: snapshot)
+                    ciStatusCache[item.id] = (updatedAt: item.updatedAt, fetchedAt: statusClock(), snapshot: snapshot)
                     ciStatusesByPullRequestID[item.id] = snapshot.status
                     ciDebugSummariesByPullRequestID[item.id] = snapshot.debugSummary
                 } else {
@@ -691,7 +700,7 @@ final class InboxViewModel: ObservableObject {
                 }
             }
         } catch {
-            guard isCurrentConnection(connectionGeneration) else {
+            guard isCurrentConnection(connectionGeneration), !Task.isCancelled else {
                 return
             }
             for item in uncachedItems {
@@ -707,7 +716,7 @@ final class InboxViewModel: ObservableObject {
             }
         }
 
-        guard isCurrentConnection(connectionGeneration) else {
+        guard isCurrentConnection(connectionGeneration), !Task.isCancelled else {
             return
         }
         await updateCIFailureAlerts(for: items, connectionGeneration: connectionGeneration)
