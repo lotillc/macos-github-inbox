@@ -86,6 +86,7 @@ struct InboxMenuView: View {
     @FocusState private var isSearchFocused: Bool
     @State private var selectedRepository = ""
     @State private var copiedRowID: String?
+    @State private var keyboardFocusRevision = 0
     @State private var selectedSection: InboxSection = .reviewRequests
     @State private var visibleRowLimitBySection: [InboxSection: Int] = [:]
     @State private var highlightedRowIDBySection: [InboxSection: String] = [:]
@@ -114,6 +115,7 @@ struct InboxMenuView: View {
         .background(
             KeyboardEventBridge(
                 handlesKeyboard: !isSearchFocused,
+                focusRevision: keyboardFocusRevision,
                 onSearch: { isSearchFocused = true },
                 onLeftArrow: selectPreviousSection,
                 onRightArrow: selectNextSection,
@@ -131,7 +133,7 @@ struct InboxMenuView: View {
             if !searchText.isEmpty {
                 do { try await Task.sleep(for: .milliseconds(250)) } catch { return }
             }
-            await model.refreshCIStatuses(for: statusRefreshCandidates)
+            await model.refreshCIStatuses(for: statusRefreshCandidates, notifyFailures: false)
             guard !Task.isCancelled else { return }
             isCheckingAttention = false
             ensureHighlightedRowIsValid()
@@ -144,6 +146,7 @@ struct InboxMenuView: View {
             ensureHighlightedRowIsValid()
         }
         .onChange(of: needsAttentionOnly) { _, _ in
+            keyboardFocusRevision += 1
             visibleRowLimitBySection = [:]
             ensureHighlightedRowIsValid()
         }
@@ -151,13 +154,16 @@ struct InboxMenuView: View {
             ensureHighlightedRowIsValid()
         }
         .onChange(of: selectedRepository) { _, _ in
+            keyboardFocusRevision += 1
             visibleRowLimitBySection = [:]
             ensureHighlightedRowIsValid()
         }
         .onChange(of: settings.sortOption) { _, _ in
+            keyboardFocusRevision += 1
             ensureHighlightedRowIsValid()
         }
         .onChange(of: selectedSection) { _, _ in
+            keyboardFocusRevision += 1
             ensureHighlightedRowIsValid()
         }
         .onChange(of: model.reviewRequests) { _, _ in
@@ -189,9 +195,7 @@ struct InboxMenuView: View {
 
             HStack(spacing: 10) {
                 Button {
-                    Task {
-                        await model.refresh()
-                    }
+                    refreshNow()
                 } label: {
                     if model.isLoading {
                         ProgressView()
@@ -484,6 +488,7 @@ struct InboxMenuView: View {
                     }
                     .buttonStyle(.plain)
                     Button {
+                        keyboardFocusRevision += 1
                         NSPasteboard.general.clearContents()
                         if NSPasteboard.general.setString(row.url.absoluteString, forType: .string) {
                             copiedRowID = row.id
@@ -561,10 +566,12 @@ struct InboxMenuView: View {
     private func loadMore() {
         let currentLimit = currentVisibleRowLimit()
         visibleRowLimitBySection[selectedSection] = currentLimit + Self.loadMoreStep
+        keyboardFocusRevision += 1
     }
 
     private func resetVisibleRowLimit() {
         visibleRowLimitBySection[selectedSection] = Self.defaultVisibleRowLimit
+        keyboardFocusRevision += 1
         ensureHighlightedRowIsValid()
     }
 
@@ -685,6 +692,7 @@ struct InboxMenuView: View {
     }
 
     private func refreshNow() {
+        keyboardFocusRevision += 1
         Task {
             await model.refresh()
         }
@@ -1026,6 +1034,7 @@ final class MenuWindowContentFittingView: NSView {
 
 private struct KeyboardEventBridge: NSViewRepresentable {
     let handlesKeyboard: Bool
+    let focusRevision: Int
     let onSearch: () -> Void
     let onLeftArrow: () -> Void
     let onRightArrow: () -> Void
@@ -1040,6 +1049,7 @@ private struct KeyboardEventBridge: NSViewRepresentable {
     func makeNSView(context: Context) -> KeyHandlingView {
         let view = KeyHandlingView()
         view.handlesKeyboard = handlesKeyboard
+        view.focusRevision = focusRevision
         view.onSearch = onSearch
         view.onLeftArrow = onLeftArrow
         view.onRightArrow = onRightArrow
@@ -1057,7 +1067,8 @@ private struct KeyboardEventBridge: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: KeyHandlingView, context: Context) {
-        let shouldRestoreFocus = handlesKeyboard && !nsView.handlesKeyboard
+        let shouldRestoreFocus = handlesKeyboard && (!nsView.handlesKeyboard || focusRevision != nsView.focusRevision)
+        nsView.focusRevision = focusRevision
         nsView.handlesKeyboard = handlesKeyboard
         nsView.onSearch = onSearch
         nsView.onLeftArrow = onLeftArrow
@@ -1079,6 +1090,7 @@ private struct KeyboardEventBridge: NSViewRepresentable {
 
 private final class KeyHandlingView: NSView {
     var handlesKeyboard = true
+    var focusRevision = 0
     var onSearch: (() -> Void)?
     var onLeftArrow: (() -> Void)?
     var onRightArrow: (() -> Void)?

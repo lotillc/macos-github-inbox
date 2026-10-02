@@ -229,3 +229,9 @@ progress and unavailable/incomplete status counts are shown separately; an unkno
 not treated as a known clean PR. Refresh retries unavailable data. Failures already contains
 failed workflows, so this toggle applies only to Assigned and Authored. Tab counts reflect
 known attention matches when the toggle is enabled.
+
+Status fetches triggered by searching, filtering, or expanding the menu do not generate CI
+failure notifications. Attention results retain the last fetched classification until a
+refresh attempt; a failed attempt marks that classification unavailable until a successful
+retry. Picker changes, copy-link actions, and list controls restore keyboard navigation while
+search editing retains text focus.

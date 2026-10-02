@@ -768,14 +768,16 @@ struct AppSettingsTests {
         #expect(model.workflowFailures.map(\.repositoryName) == ["acme/backend"])
     }
 
-    @Test
-    func expiredCleanStatusIsIncompleteAfterRefreshFails() async throws {
+    @Test(arguments: ["SUCCESS", "FAILURE"])
+    func attentionFetchRetainsResultsUntilAttemptAndDoesNotNotify(checkState: String) async throws {
         let tokenStore = testTokenStore(account: "attention-refresh-outage")
         defer { try? tokenStore.deleteCredential() }
         let settings = makeSettings(account: "attention-refresh-outage", tokenStore: tokenStore,
                                     configuration: GitHubAuthConfiguration(clientID: "", appSlug: "", expectedOwners: []))
         let clock = LockedSettingsTestInt(1_000)
         let failStatus = LockedSettingsTestInt(0)
+        let failingChecks = LockedSettingsTestInt(checkState == "FAILURE" ? 1 : 0)
+        let notifications = LockedSettingsTestInt(0)
         let session = makeSettingsMockSession { request in
             let url = try #require(request.url)
             switch url.path {
@@ -788,14 +790,15 @@ struct AppSettingsTests {
             case "/search/issues":
                 return settingsJSONResponse(statusCode: 200, body: #"{"total_count":0,"items":[]}"#)
             case "/graphql" where failStatus.load() == 0:
-                return settingsJSONResponse(statusCode: 200, body: #"{"data":{"repo0":{"pr0_0":{"reviewDecision":"APPROVED","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","statusCheckRollup":{"state":"SUCCESS","contexts":{"nodes":[]}},"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}"#)
+                return settingsJSONResponse(statusCode: 200, body: #"{"data":{"repo0":{"pr0_0":{"reviewDecision":"APPROVED","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","statusCheckRollup":{"state":"SUCCESS","contexts":{"nodes":[]}},"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}"#.replacingOccurrences(of: "SUCCESS", with: failingChecks.load() == 1 ? "FAILURE" : "SUCCESS"))
             default:
                 return settingsJSONResponse(statusCode: 503, body: #"{"message":"temporary outage"}"#)
             }
         }
         let provider = GitHubAuthProvider(configuration: settings.gitHubAppConfiguration, session: session, tokenStore: tokenStore)
         let model = InboxViewModel(settings: settings, authProvider: provider, clientSession: session,
-                                   statusClock: { Date(timeIntervalSince1970: Double(clock.load())) })
+                                   statusClock: { Date(timeIntervalSince1970: Double(clock.load())) },
+                                   notificationDelivery: { _, _, _ in notifications.store(notifications.load() + 1) })
         guard await waitForMissingConfiguration(in: model, timeout: 2) else {
             Issue.record("Initial refresh did not finish.")
             return
@@ -808,13 +811,37 @@ struct AppSettingsTests {
         let item = PullRequestItem(id: "acme/backend#7", repositoryName: "acme/backend", number: 7,
                                    title: "Test", url: URL(string: "https://github.com/acme/backend/pull/7")!,
                                    createdAt: .now, updatedAt: .now, isDraft: false)
-        await model.refreshCIStatuses(for: [item])
+        // A view-first fetch must not prevent a notifying cache hit from establishing the baseline.
+        await model.refreshCIStatuses(for: [item], notifyFailures: false)
+        #expect(notifications.load() == 0)
+        await model.refreshCIStatuses(for: [item], notifyFailures: true)
         #expect(model.statusSnapshot(for: item)?.hasIncompleteAttentionStatus == false)
+        let other = PullRequestItem(id: "acme/backend#8", repositoryName: "acme/backend", number: 8,
+                                    title: "Existing failure beyond the startup prefix", url: URL(string: "https://github.com/acme/backend/pull/8")!,
+                                    createdAt: item.createdAt, updatedAt: item.updatedAt, isDraft: false)
+        await model.refreshCIStatuses(for: [other], notifyFailures: false)
+        #expect(!model.hasActiveAlert)
+        #expect(model.statusSnapshot(for: other)?.needsAttention == (checkState == "FAILURE"))
         clock.store(1_061)
+        // Expiry alone must not remove a row during copying or keyboard navigation.
+        #expect(model.statusSnapshot(for: item)?.hasIncompleteAttentionStatus == false)
+        #expect(model.statusSnapshot(for: item)?.needsAttention == (checkState == "FAILURE"))
         failStatus.store(1)
         await model.refreshCIStatuses(for: [item])
         #expect(model.statusSnapshot(for: item) == nil)
         #expect(model.statusSnapshot(for: item)?.hasIncompleteAttentionStatus != false)
+        failStatus.store(0)
+        await model.refreshCIStatuses(for: [item], notifyFailures: false)
+        #expect(model.statusSnapshot(for: item)?.hasIncompleteAttentionStatus == false)
+        #expect(!model.hasActiveAlert)
+        #expect(notifications.load() == 0)
+        if checkState == "SUCCESS" {
+            failingChecks.store(1)
+            clock.store(1_122)
+            await model.refreshCIStatuses(for: [item], notifyFailures: true)
+            #expect(model.hasActiveAlert)
+            #expect(notifications.load() == 1)
+        }
     }
 
     @Test
