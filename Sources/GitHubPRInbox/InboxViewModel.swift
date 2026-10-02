@@ -31,7 +31,7 @@ final class InboxViewModel: ObservableObject {
     private var workflowFailureSource: [WorkflowFailureItem] = []
     private var timerCancellable: AnyCancellable?
     private var cancellables = Set<AnyCancellable>()
-    private var ciStatusCache: [String: (updatedAt: Date, snapshot: PullRequestStatusSnapshot)] = [:]
+    private var ciStatusCache: [String: (updatedAt: Date, fetchedAt: Date, snapshot: PullRequestStatusSnapshot)] = [:]
     private var notifiedWorkflowFailureIDs = Set<String>()
     private var activeWorkflowFailureAlertIDs = Set<String>()
     private var hasEstablishedWorkflowFailureBaseline = false
@@ -619,6 +619,11 @@ final class InboxViewModel: ObservableObject {
         ciStatusesByPullRequestID[item.id] ?? .unknown
     }
 
+    func unresolvedThreadCount(for item: PullRequestItem) -> Int? {
+        guard let cached = ciStatusCache[item.id], cached.updatedAt == item.updatedAt else { return nil }
+        return cached.snapshot.unresolvedThreadCount
+    }
+
     func ciDebugSummary(for item: PullRequestItem) -> String? {
         ciDebugSummariesByPullRequestID[item.id]
     }
@@ -653,6 +658,8 @@ final class InboxViewModel: ObservableObject {
             }
 
             return cached.updatedAt != item.updatedAt
+                || cached.snapshot.unresolvedThreadCount == nil
+                || Date().timeIntervalSince(cached.fetchedAt) >= 60
         }
 
         guard !uncachedItems.isEmpty else {
@@ -675,7 +682,7 @@ final class InboxViewModel: ObservableObject {
 
             for item in uncachedItems {
                 if let snapshot = snapshotsByItemID[item.id] {
-                    ciStatusCache[item.id] = (updatedAt: item.updatedAt, snapshot: snapshot)
+                    ciStatusCache[item.id] = (updatedAt: item.updatedAt, fetchedAt: .now, snapshot: snapshot)
                     ciStatusesByPullRequestID[item.id] = snapshot.status
                     ciDebugSummariesByPullRequestID[item.id] = snapshot.debugSummary
                 } else {

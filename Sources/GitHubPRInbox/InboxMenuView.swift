@@ -12,6 +12,18 @@ private enum PullRequestDateFormatter {
     static func relativeString(for date: Date) -> String {
         relativeFormatter.localizedString(for: date, relativeTo: .now)
     }
+
+    static func ageString(for date: Date) -> String {
+        let seconds = max(0, Date().timeIntervalSince(date))
+        let units: [(seconds: Double, suffix: String)] = [
+            (31_536_000, "y"), (2_592_000, "mo"), (604_800, "w"),
+            (86_400, "d"), (3_600, "h"), (60, "m"),
+        ]
+        for unit in units where seconds >= unit.seconds {
+            return "\(Int(seconds / unit.seconds))\(unit.suffix)"
+        }
+        return "now"
+    }
 }
 
 struct InboxMenuView: View {
@@ -59,9 +71,8 @@ struct InboxMenuView: View {
 
     private static let defaultVisibleRowLimit = 10
     private static let loadMoreStep = 10
-    private static let maxVisibleRowLimit = 30
     fileprivate static let rowHeight: CGFloat = 28
-    private static let menuWidth: CGFloat = 580
+    private static let menuWidth: CGFloat = 680
     fileprivate static let workflowRepoColumnWidth: CGFloat = 180
     fileprivate static let workflowBranchColumnWidth: CGFloat = 132
 
@@ -69,6 +80,8 @@ struct InboxMenuView: View {
     @ObservedObject var settings: AppSettings
     let openSettings: () -> Void
 
+    @State private var selectedRepository = ""
+    @State private var copiedRowID: String?
     @State private var selectedSection: InboxSection = .reviewRequests
     @State private var visibleRowLimitBySection: [InboxSection: Int] = [:]
     @State private var highlightedRowIDBySection: [InboxSection: String] = [:]
@@ -85,6 +98,7 @@ struct InboxMenuView: View {
                 onboardingSection
             } else {
                 sectionPicker
+                listControls
                 contentArea
             }
         }
@@ -109,6 +123,13 @@ struct InboxMenuView: View {
             await model.refreshCIStatuses(for: visiblePullRequestsForCurrentSection())
         }
         .onAppear {
+            ensureHighlightedRowIsValid()
+        }
+        .onChange(of: selectedRepository) { _, _ in
+            visibleRowLimitBySection = [:]
+            ensureHighlightedRowIsValid()
+        }
+        .onChange(of: settings.sortOption) { _, _ in
             ensureHighlightedRowIsValid()
         }
         .onChange(of: selectedSection) { _, _ in
@@ -206,6 +227,48 @@ struct InboxMenuView: View {
         }
     }
 
+    private var repositoryNames: [String] {
+        Array(Set(model.reviewRequests.map(\.repositoryName)
+            + model.authoredPullRequests.map(\.repositoryName)
+            + model.workflowFailures.map(\.repositoryName)))
+            .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+
+    private var listControls: some View {
+        HStack(spacing: 8) {
+            Picker("Repository", selection: $selectedRepository) {
+                Text("All repositories").tag("")
+                ForEach(repositoryNames, id: \.self) { repository in
+                    Text(repository).tag(repository)
+                }
+                if !selectedRepository.isEmpty && !repositoryNames.contains(selectedRepository) {
+                    Text(selectedRepository).tag(selectedRepository)
+                }
+            }
+            .labelsHidden()
+            .accessibilityLabel("Filter by repository")
+            .frame(maxWidth: .infinity)
+            if !selectedRepository.isEmpty {
+                Button { selectedRepository = "" } label: {
+                    Image(systemName: "xmark.circle.fill")
+                }
+                .buttonStyle(.borderless)
+                .help("Clear repository filter")
+            }
+            if selectedSection != .workflowFailures {
+                Picker("Sort", selection: $settings.sortOption) {
+                    ForEach(PullRequestSortOption.allCases) { option in
+                        Text(option.title).tag(option)
+                    }
+                }
+                .labelsHidden()
+                .accessibilityLabel("Sort pull requests")
+                .frame(width: 180)
+            }
+        }
+        .controlSize(.small)
+    }
+
     private var onboardingSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Finish Setup")
@@ -261,10 +324,24 @@ struct InboxMenuView: View {
                     .foregroundStyle(.secondary)
                     .padding(.vertical, 6)
             } else {
-                listContent(selectableRows: selectableRows(
-                    pullRequests: visiblePullRequests,
-                    workflowFailures: visibleWorkflowFailures
-                ))
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        listContent(selectableRows: selectableRows(
+                            pullRequests: visiblePullRequests,
+                            workflowFailures: visibleWorkflowFailures
+                        ))
+                    }
+                    .frame(height: CGFloat(min(visibleCount, 10)) * (Self.rowHeight + 4))
+                    .onChange(of: highlightedRowID) { _, id in
+                        if let id { proxy.scrollTo(id) }
+                    }
+                    .onChange(of: currentSelectableRows().map(\.id)) { _, _ in
+                        if let highlightedRowID { proxy.scrollTo(highlightedRowID) }
+                    }
+                }
+                Text("Showing \(visibleCount) of \(currentCount)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
             }
 
             if currentCount > visibleCount {
@@ -290,29 +367,50 @@ struct InboxMenuView: View {
     private func listContent(selectableRows: [SelectableRow]) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             ForEach(selectableRows) { row in
-                Button {
-                    open(row)
-                } label: {
-                    switch row {
-                    case let .pullRequest(item):
-                        PullRequestRow(
-                            item: item,
-                            ciStatus: model.ciStatus(for: item),
-                            debugSummary: model.ciDebugSummary(for: item),
-                            isHighlighted: highlightedRowID == row.id,
-                            isNew: selectedSection == .reviewRequests
-                                ? model.newlyAssignedPullRequestIDs.contains(item.id)
-                                : model.newlyAuthoredPullRequestIDs.contains(item.id)
-                        )
-                    case let .workflowFailure(item):
-                        WorkflowFailureRow(
-                            item: item,
-                            isHighlighted: highlightedRowID == row.id,
-                            isNew: model.newlyWorkflowFailureIDs.contains(item.id)
-                        )
+                HStack(spacing: 2) {
+                    Button { open(row) } label: {
+                        switch row {
+                        case let .pullRequest(item):
+                            PullRequestRow(
+                                item: item,
+                                ciStatus: model.ciStatus(for: item),
+                                debugSummary: model.ciDebugSummary(for: item),
+                                unresolvedThreadCount: model.unresolvedThreadCount(for: item),
+                                showRepository: selectedRepository.isEmpty,
+                                isHighlighted: highlightedRowID == row.id,
+                                isNew: selectedSection == .reviewRequests
+                                    ? model.newlyAssignedPullRequestIDs.contains(item.id)
+                                    : model.newlyAuthoredPullRequestIDs.contains(item.id)
+                            )
+                        case let .workflowFailure(item):
+                            WorkflowFailureRow(
+                                item: item,
+                                isHighlighted: highlightedRowID == row.id,
+                                isNew: model.newlyWorkflowFailureIDs.contains(item.id)
+                            )
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    Button {
+                        NSPasteboard.general.clearContents()
+                        if NSPasteboard.general.setString(row.url.absoluteString, forType: .string) {
+                            copiedRowID = row.id
+                        }
+                    } label: {
+                        Image(systemName: copiedRowID == row.id ? "checkmark" : "link")
+                            .font(.system(size: 11))
+                            .frame(width: 24, height: Self.rowHeight)
+                    }
+                    .buttonStyle(.borderless)
+                    .help(copiedRowID == row.id ? "Link copied" : "Copy link")
+                    .accessibilityLabel("Copy link")
+                    .task(id: copiedRowID == row.id) {
+                        guard copiedRowID == row.id else { return }
+                        do { try await Task.sleep(for: .seconds(2)) } catch { return }
+                        if copiedRowID == row.id { copiedRowID = nil }
                     }
                 }
-                .buttonStyle(.plain)
+                .id(row.id)
             }
         }
     }
@@ -325,17 +423,17 @@ struct InboxMenuView: View {
         case .reviewRequests:
             (
                 items: sortedPullRequests(model.reviewRequests),
-                emptyText: "No assigned PRs."
+                emptyText: selectedRepository.isEmpty ? "No assigned PRs." : "No assigned PRs in this repository."
             )
         case .authoredPullRequests:
             (
                 items: sortedPullRequests(model.authoredPullRequests),
-                emptyText: "No authored PRs."
+                emptyText: selectedRepository.isEmpty ? "No authored PRs." : "No authored PRs in this repository."
             )
         case .workflowFailures:
             (
                 items: [],
-                emptyText: "No failed actions."
+                emptyText: selectedRepository.isEmpty ? "No failed actions." : "No failed actions in this repository."
             )
         }
     }
@@ -343,19 +441,16 @@ struct InboxMenuView: View {
     private func sectionCount(for section: InboxSection) -> String {
         switch section {
         case .reviewRequests:
-            "\(model.reviewRequests.count)"
+            "\(sortedPullRequests(model.reviewRequests).count)"
         case .authoredPullRequests:
-            "\(model.authoredPullRequests.count)"
+            "\(sortedPullRequests(model.authoredPullRequests).count)"
         case .workflowFailures:
-            "\(model.workflowFailures.count)"
+            "\(prioritizedWorkflowFailures(model.workflowFailures).count)"
         }
     }
 
     private func currentVisibleRowLimit() -> Int {
-        min(
-            visibleRowLimitBySection[selectedSection, default: Self.defaultVisibleRowLimit],
-            Self.maxVisibleRowLimit
-        )
+        visibleRowLimitBySection[selectedSection, default: Self.defaultVisibleRowLimit]
     }
 
     private func visibleItemCount(for totalCount: Int) -> Int {
@@ -364,24 +459,25 @@ struct InboxMenuView: View {
 
     private func loadMore() {
         let currentLimit = currentVisibleRowLimit()
-        visibleRowLimitBySection[selectedSection] = min(currentLimit + Self.loadMoreStep, Self.maxVisibleRowLimit)
+        visibleRowLimitBySection[selectedSection] = currentLimit + Self.loadMoreStep
     }
 
     private func resetVisibleRowLimit() {
         visibleRowLimitBySection[selectedSection] = Self.defaultVisibleRowLimit
+        ensureHighlightedRowIsValid()
     }
 
     private func loadMoreTitle(visibleCount: Int, totalCount: Int) -> String {
         let nextCount = min(
             visibleCount + Self.loadMoreStep,
-            min(totalCount, Self.maxVisibleRowLimit)
+            totalCount
         )
-        return "Load More (\(nextCount))"
+        return "Show \(nextCount - visibleCount) more"
     }
 
     private var visibleCITaskKey: String {
         let ids = visiblePullRequestsForCurrentSection().map(\.id).joined(separator: ",")
-        return "\(selectedSection.rawValue)|\(ids)"
+        return "\(selectedSection.rawValue)|\(ids)|\(visiblePullRequestsForCurrentSection().map { $0.updatedAt.timeIntervalSince1970 })"
     }
 
     private var menuSizingKey: String {
@@ -520,29 +616,14 @@ struct InboxMenuView: View {
     }
 
     private func sortedPullRequests(_ items: [PullRequestItem]) -> [PullRequestItem] {
-        items.sorted { lhs, rhs in
-            if settings.sortOption == .oldestFirst {
-                if lhs.createdAt != rhs.createdAt {
-                    return lhs.createdAt < rhs.createdAt
-                }
-                if lhs.updatedAt != rhs.updatedAt {
-                    return lhs.updatedAt < rhs.updatedAt
-                }
-            } else {
-                if lhs.updatedAt != rhs.updatedAt {
-                    return lhs.updatedAt > rhs.updatedAt
-                }
-                if lhs.createdAt != rhs.createdAt {
-                    return lhs.createdAt > rhs.createdAt
-                }
-            }
-
-            return lhs.number > rhs.number
-        }
+        PullRequestStore.sorted(
+            items.filter { selectedRepository.isEmpty || $0.repositoryName == selectedRepository },
+            sortOption: settings.sortOption
+        )
     }
 
     private func prioritizedWorkflowFailures(_ items: [WorkflowFailureItem]) -> [WorkflowFailureItem] {
-        items.sorted { lhs, rhs in
+        items.filter { selectedRepository.isEmpty || $0.repositoryName == selectedRepository }.sorted { lhs, rhs in
             let lhsIsNew = model.newlyWorkflowFailureIDs.contains(lhs.id)
             let rhsIsNew = model.newlyWorkflowFailureIDs.contains(rhs.id)
 
@@ -588,6 +669,8 @@ private struct PullRequestRow: View {
     let item: PullRequestItem
     let ciStatus: PullRequestCIStatus
     let debugSummary: String?
+    let unresolvedThreadCount: Int?
+    let showRepository: Bool
     let isHighlighted: Bool
     let isNew: Bool
 
@@ -603,7 +686,10 @@ private struct PullRequestRow: View {
                 .lineLimit(1)
                 .frame(maxWidth: .infinity, alignment: .leading)
 
-            RepoPill(text: item.repositoryName)
+            if showRepository {
+                RepoPill(text: item.repositoryName.split(separator: "/").last.map(String.init) ?? item.repositoryName, width: 140)
+                    .help(item.repositoryName)
+            }
 
             if item.isDraft {
                 Text("Draft")
@@ -615,12 +701,20 @@ private struct PullRequestRow: View {
                 NewPill()
             }
 
-            Text("#\(item.number)")
+            Label(unresolvedThreadCount.map(String.init) ?? "–", systemImage: "text.bubble")
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle((unresolvedThreadCount ?? 0) > 0 ? Color.orange : Color.secondary)
+                .frame(width: 38, alignment: .trailing)
+                .help(unresolvedThreadCount.map { "\($0) unresolved review threads" } ?? "Review threads unavailable")
+                .accessibilityLabel(unresolvedThreadCount.map { "\($0) unresolved review threads" } ?? "Review threads unavailable")
+
+            Text(String(item.number))
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
+                .frame(minWidth: 36, alignment: .trailing)
 
-            Text(PullRequestDateFormatter.relativeString(for: item.updatedAt))
+            Text(PullRequestDateFormatter.ageString(for: item.updatedAt))
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
@@ -637,10 +731,10 @@ private struct PullRequestRow: View {
 
     private var helpText: String {
         if let debugSummary, !debugSummary.isEmpty {
-            return "\(ciStatus.accessibilityLabel)\n\(debugSummary)"
+            return "\(item.title)\n\(item.repositoryName) · PR \(item.number)\n\(ciStatus.accessibilityLabel)\n\(debugSummary)"
         }
 
-        return ciStatus.accessibilityLabel
+        return "\(item.title)\n\(item.repositoryName) · PR \(item.number)\n\(ciStatus.accessibilityLabel)"
     }
 
     private var backgroundStyle: some ShapeStyle {
@@ -681,7 +775,7 @@ private struct WorkflowFailureRow: View {
                 NewPill()
             }
 
-            Text(PullRequestDateFormatter.relativeString(for: item.updatedAt))
+            Text(PullRequestDateFormatter.ageString(for: item.updatedAt))
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)

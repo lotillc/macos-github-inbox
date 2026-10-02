@@ -106,3 +106,20 @@ struct PullRequestStoreTests {
         #expect(snapshot.reviewRequests.first?.title == "Fresh")
     }
 }
+
+extension PullRequestStoreTests {
+    @Test
+    func sortsNumbersNumericallyWithStableTies() {
+        let now = Date(timeIntervalSince1970: 1_000)
+        func item(_ repo: String, _ number: Int) -> PullRequestItem {
+            PullRequestItem(id: "\(repo)#\(number)", repositoryName: repo, number: number,
+                            title: "Test", url: URL(string: "https://example.com")!,
+                            createdAt: now, updatedAt: now, isDraft: false)
+        }
+        let items = [item("z/app", 9), item("a/app", 100), item("b/app", 100)]
+        #expect(PullRequestStore.sorted(items, sortOption: .highestNumberFirst).map(\.id)
+                == ["a/app#100", "b/app#100", "z/app#9"])
+        #expect(PullRequestStore.sorted(items, sortOption: .lowestNumberFirst).map(\.number)
+                == [9, 100, 100])
+    }
+}
