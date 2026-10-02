@@ -30,6 +30,12 @@ enum GitHubClientError: LocalizedError {
     }
 }
 
+struct PartialStatusFetchError: LocalizedError {
+    let snapshots: [String: PullRequestStatusSnapshot]
+    let message: String
+    var errorDescription: String? { message }
+}
+
 actor GitHubClient {
     private struct GraphQLRequestBody: Encodable {
         let query: String
@@ -417,10 +423,15 @@ actor GitHubClient {
             } catch {
                 try Task.checkCancellation()
                 // Authentication and quota failures cannot be repaired by issuing more requests.
-                if error is GitHubAuthError { throw error }
+                if error is GitHubAuthError {
+                    if !snapshots.isEmpty { throw PartialStatusFetchError(snapshots: snapshots, message: error.localizedDescription) }
+                    throw error
+                }
                 if let clientError = error as? GitHubClientError {
                     switch clientError {
-                    case .unauthorized, .rateLimited, .missingToken: throw error
+                    case .unauthorized, .rateLimited, .missingToken:
+                        if !snapshots.isEmpty { throw PartialStatusFetchError(snapshots: snapshots, message: error.localizedDescription) }
+                        throw error
                     default: break
                     }
                 }
@@ -677,6 +688,7 @@ actor GitHubClient {
                 mergeable: mergeable,
                 mergeStateStatus: mergeStateStatus
             )
+            snapshot.hasKnownMergeability = mergeable == "MERGEABLE" || mergeable == "CONFLICTING" || mergeStateStatus == "DIRTY"
             if let threads = pullRequestNode?.reviewThreads {
                 // Thread failures must not discard a successfully fetched CI status.
                 snapshot.unresolvedThreadCount = try? await unresolvedThreadCount(for: item, firstPage: threads)

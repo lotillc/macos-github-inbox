@@ -66,10 +66,32 @@ struct GitHubStatusBatchTests {
         #expect(recorder.headRequests == 0)
     }
 
+    @Test
+    func preservesCompletedBatchesWhenLaterQuotaFails() async {
+        let (client, recorder) = client(mode: .laterRateLimited)
+        do {
+            _ = try await client.fetchCIStatusSnapshots(for: items(55))
+            Issue.record("Expected a partial failure.")
+        } catch let error as PartialStatusFetchError {
+            #expect(error.snapshots.count == 20)
+            #expect(error.snapshots["acme/app#1"]?.hasIncompleteAttentionStatus == false)
+            #expect(error.localizedDescription.contains("rate limit"))
+        } catch { Issue.record("Unexpected error: \(error)") }
+        #expect(recorder.batchCounts == [20, 20])
+        #expect(recorder.headRequests == 0)
+    }
+
+    @Test
+    func pendingMergeabilityRemainsIncomplete() async throws {
+        let (client, _) = client(mode: .unknownMergeability)
+        let snapshots = try await client.fetchCIStatusSnapshots(for: items(1))
+        #expect(snapshots["acme/app#1"]?.hasIncompleteAttentionStatus == true)
+        #expect(snapshots["acme/app#1"]?.unresolvedThreadCount == 0)
+    }
 }
 
 private final class StatusBatchRecorder: @unchecked Sendable {
-    enum Mode: Sendable { case success, fallback, rateLimited, graphRateLimited, successLastQuota }
+    enum Mode: Sendable { case success, fallback, rateLimited, graphRateLimited, successLastQuota, laterRateLimited, unknownMergeability }
     let mode: Mode
     private let lock = NSLock()
     private var batches: [Int] = []
@@ -130,10 +152,17 @@ private final class StatusBatchURLProtocol: URLProtocol, @unchecked Sendable {
         var headers: [String: String] = [:]
         if isGraphQL {
             switch recorder.mode {
-            case .success, .successLastQuota:
+            case .success, .successLastQuota, .laterRateLimited, .unknownMergeability:
                 if recorder.mode == .successLastQuota { headers = ["X-RateLimit-Remaining": "0"] }
-                let node = #"{"reviewDecision":"APPROVED","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","statusCheckRollup":{"state":"SUCCESS","contexts":{"nodes":[]}},"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}"#
-                json = "{\"data\":{\"repo0\":{" + (0..<count).map { "\"pr0_\($0)\":\(node)" }.joined(separator: ",") + "}}}"
+                var node = #"{"reviewDecision":"APPROVED","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","statusCheckRollup":{"state":"SUCCESS","contexts":{"nodes":[]}},"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}"#
+                if recorder.mode == .unknownMergeability { node = node.replacingOccurrences(of: "MERGEABLE", with: "UNKNOWN") }
+                if recorder.mode == .laterRateLimited && recorder.batchCounts.count > 1 {
+                    statusCode = 403
+                    headers = ["X-RateLimit-Remaining": "0"]
+                    json = #"{"message":"API rate limit exceeded"}"#
+                } else {
+                    json = "{\"data\":{\"repo0\":{" + (0..<count).map { "\"pr0_\($0)\":\(node)" }.joined(separator: ",") + "}}}"
+                }
             case .fallback:
                 json = #"{"errors":[{"message":"GraphQL unavailable"}]}"#
             case .graphRateLimited:

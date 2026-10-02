@@ -777,6 +777,9 @@ struct AppSettingsTests {
         let clock = LockedSettingsTestInt(1_000)
         let failStatus = LockedSettingsTestInt(0)
         let failingChecks = LockedSettingsTestInt(checkState == "FAILURE" ? 1 : 0)
+        let unknownMergeability = LockedSettingsTestInt(0)
+        let partialBatchMode = LockedSettingsTestInt(0)
+        let graphRequests = LockedSettingsTestInt(0)
         let notifications = LockedSettingsTestInt(0)
         let session = makeSettingsMockSession { request in
             let url = try #require(request.url)
@@ -790,7 +793,11 @@ struct AppSettingsTests {
             case "/search/issues":
                 return settingsJSONResponse(statusCode: 200, body: #"{"total_count":0,"items":[]}"#)
             case "/graphql" where failStatus.load() == 0:
-                return settingsJSONResponse(statusCode: 200, body: #"{"data":{"repo0":{"pr0_0":{"reviewDecision":"APPROVED","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","statusCheckRollup":{"state":"SUCCESS","contexts":{"nodes":[]}},"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}"#.replacingOccurrences(of: "SUCCESS", with: failingChecks.load() == 1 ? "FAILURE" : "SUCCESS"))
+                graphRequests.store(graphRequests.load() + 1)
+                if partialBatchMode.load() == 1 && graphRequests.load() > 1 {
+                    return settingsJSONResponse(statusCode: 429, body: #"{"message":"API rate limit exceeded"}"#)
+                }
+                return settingsJSONResponse(statusCode: 200, body: #"{"data":{"repo0":{"pr0_0":{"reviewDecision":"APPROVED","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","statusCheckRollup":{"state":"SUCCESS","contexts":{"nodes":[]}},"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}"#.replacingOccurrences(of: "SUCCESS", with: failingChecks.load() == 1 ? "FAILURE" : "SUCCESS").replacingOccurrences(of: "MERGEABLE", with: unknownMergeability.load() == 1 ? "UNKNOWN" : "MERGEABLE"))
             default:
                 return settingsJSONResponse(statusCode: 503, body: #"{"message":"temporary outage"}"#)
             }
@@ -822,7 +829,19 @@ struct AppSettingsTests {
         await model.refreshCIStatuses(for: [other], notifyFailures: false)
         #expect(!model.hasActiveAlert)
         #expect(model.statusSnapshot(for: other)?.needsAttention == (checkState == "FAILURE"))
+        await model.refreshCIStatuses(for: [other], notifyFailures: true)
+        #expect(!model.hasActiveAlert)
+        #expect(notifications.load() == 0)
+        unknownMergeability.store(1)
         clock.store(1_061)
+        await model.refreshCIStatuses(for: [item])
+        #expect(model.statusSnapshot(for: item)?.hasIncompleteAttentionStatus == true)
+        let requestsBeforeRetry = graphRequests.load()
+        unknownMergeability.store(0)
+        await model.refreshCIStatuses(for: [item])
+        #expect(graphRequests.load() == requestsBeforeRetry + 1)
+        #expect(model.statusSnapshot(for: item)?.hasIncompleteAttentionStatus == false)
+        clock.store(1_122)
         // Expiry alone must not remove a row during copying or keyboard navigation.
         #expect(model.statusSnapshot(for: item)?.hasIncompleteAttentionStatus == false)
         #expect(model.statusSnapshot(for: item)?.needsAttention == (checkState == "FAILURE"))
@@ -837,11 +856,26 @@ struct AppSettingsTests {
         #expect(notifications.load() == 0)
         if checkState == "SUCCESS" {
             failingChecks.store(1)
-            clock.store(1_122)
+            clock.store(1_183)
             await model.refreshCIStatuses(for: [item], notifyFailures: true)
             #expect(model.hasActiveAlert)
             #expect(notifications.load() == 1)
         }
+        // A later quota failure must retain the first completed batch in the model.
+        partialBatchMode.store(1)
+        graphRequests.store(0)
+        clock.store(1_244)
+        let batch = [item] + (9...28).map { number in
+            PullRequestItem(id: "acme/backend#\(number)", repositoryName: "acme/backend", number: number,
+                            title: "Batch", url: URL(string: "https://github.com/acme/backend/pull/\(number)")!,
+                            createdAt: item.createdAt, updatedAt: item.updatedAt, isDraft: false)
+        }
+        await model.refreshCIStatuses(for: batch)
+        #expect(graphRequests.load() == 2)
+        #expect(model.statusSnapshot(for: item)?.hasIncompleteAttentionStatus == false)
+        #expect(model.statusSnapshot(for: batch.last!) == nil)
+        #expect(model.ciDebugSummary(for: batch.last!)?.contains("rate limit") == true)
+
     }
 
     @Test

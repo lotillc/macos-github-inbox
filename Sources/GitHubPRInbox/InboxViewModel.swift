@@ -683,7 +683,7 @@ final class InboxViewModel: ObservableObject {
 
             return cached.updatedAt != item.updatedAt
                 || invalidAttentionSnapshotIDs.contains(item.id)
-                || cached.snapshot.unresolvedThreadCount == nil
+                || cached.snapshot.hasIncompleteAttentionStatus
                 || statusClock().timeIntervalSince(cached.fetchedAt) >= 60
         }
 
@@ -694,9 +694,12 @@ final class InboxViewModel: ObservableObject {
                     ciDebugSummariesByPullRequestID[item.id] = cached.snapshot.debugSummary
                 }
             }
-            if notifyFailures && !items.isEmpty,
-               isCurrentConnection(connectionGeneration), !Task.isCancelled {
-                await updateCIFailureAlerts(for: items, connectionGeneration: connectionGeneration)
+            if !items.isEmpty, isCurrentConnection(connectionGeneration), !Task.isCancelled {
+                if notifyFailures {
+                    await updateCIFailureAlerts(for: items, connectionGeneration: connectionGeneration)
+                } else {
+                    baselineKnownFailures(for: items)
+                }
             }
             return
         }
@@ -725,10 +728,18 @@ final class InboxViewModel: ObservableObject {
             guard isCurrentConnection(connectionGeneration), !Task.isCancelled else {
                 return
             }
+            let completed = (error as? PartialStatusFetchError)?.snapshots ?? [:]
             for item in uncachedItems {
-                ciStatusesByPullRequestID[item.id] = .unknown
-                ciDebugSummariesByPullRequestID[item.id] = "error=\(error.localizedDescription)"
-                invalidAttentionSnapshotIDs.insert(item.id)
+                if let snapshot = completed[item.id] {
+                    ciStatusCache[item.id] = (updatedAt: item.updatedAt, fetchedAt: statusClock(), snapshot: snapshot)
+                    invalidAttentionSnapshotIDs.remove(item.id)
+                    ciStatusesByPullRequestID[item.id] = snapshot.status
+                    ciDebugSummariesByPullRequestID[item.id] = snapshot.debugSummary
+                } else {
+                    ciStatusesByPullRequestID[item.id] = .unknown
+                    ciDebugSummariesByPullRequestID[item.id] = "error=\(error.localizedDescription)"
+                    invalidAttentionSnapshotIDs.insert(item.id)
+                }
             }
         }
 
@@ -744,7 +755,15 @@ final class InboxViewModel: ObservableObject {
         }
         if notifyFailures {
             await updateCIFailureAlerts(for: items, connectionGeneration: connectionGeneration)
+        } else {
+            baselineKnownFailures(for: items)
         }
+    }
+
+    private func baselineKnownFailures(for items: [PullRequestItem]) {
+        notifiedCIFailureIDs.formUnion(items.filter {
+            statusSnapshot(for: $0)?.status == .failure
+        }.map(\.id))
     }
 
     private func bindSettings() {

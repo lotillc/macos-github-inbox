@@ -47,6 +47,7 @@ struct InboxListFilterTests {
     func distinguishesIncompleteStatusFromKnownCleanStatus() {
         #expect(PullRequestStatusSnapshot(status: .ciPassed, debugSummary: "").hasIncompleteAttentionStatus)
         #expect(PullRequestStatusSnapshot(status: .unknown, debugSummary: "", unresolvedThreadCount: 0).hasIncompleteAttentionStatus)
-        #expect(!PullRequestStatusSnapshot(status: .ciPassed, debugSummary: "", unresolvedThreadCount: 0).hasIncompleteAttentionStatus)
+        #expect(PullRequestStatusSnapshot(status: .ciPassed, debugSummary: "", unresolvedThreadCount: 0).hasIncompleteAttentionStatus)
+        #expect(!PullRequestStatusSnapshot(status: .ciPassed, debugSummary: "", unresolvedThreadCount: 0, hasKnownMergeability: true).hasIncompleteAttentionStatus)
     }
 }

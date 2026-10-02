@@ -146,6 +146,7 @@ struct PullRequestStatusSnapshot: Equatable {
     let status: PullRequestCIStatus
     let debugSummary: String
     var unresolvedThreadCount: Int? = nil
+    var hasKnownMergeability: Bool = false
 }
 
 struct WorkflowFailureItem: Identifiable, Hashable {
@@ -275,6 +276,6 @@ extension PullRequestStatusSnapshot {
     }
 
     var hasIncompleteAttentionStatus: Bool {
-        status == .unknown || unresolvedThreadCount == nil
+        status == .unknown || unresolvedThreadCount == nil || !hasKnownMergeability
     }
 }
