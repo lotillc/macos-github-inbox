@@ -768,6 +768,170 @@ struct AppSettingsTests {
         #expect(model.workflowFailures.map(\.repositoryName) == ["acme/backend"])
     }
 
+    @Test(arguments: ["SUCCESS", "FAILURE"])
+    func attentionFetchRetainsResultsUntilAttemptAndDoesNotNotify(checkState: String) async throws {
+        let tokenStore = testTokenStore(account: "attention-refresh-outage")
+        defer { try? tokenStore.deleteCredential() }
+        let settings = makeSettings(account: "attention-refresh-outage", tokenStore: tokenStore,
+                                    configuration: GitHubAuthConfiguration(clientID: "", appSlug: "", expectedOwners: []))
+        let clock = LockedSettingsTestInt(1_000)
+        let failStatus = LockedSettingsTestInt(0)
+        let failingChecks = LockedSettingsTestInt(checkState == "FAILURE" ? 1 : 0)
+        let unknownMergeability = LockedSettingsTestInt(0)
+        let partialBatchMode = LockedSettingsTestInt(0)
+        let graphRequests = LockedSettingsTestInt(0)
+        let notifications = LockedSettingsTestInt(0)
+        let session = makeSettingsMockSession { request in
+            let url = try #require(request.url)
+            switch url.path {
+            case "/user/installations":
+                return settingsJSONResponse(statusCode: 200, body: #"{"installations":[{"id":1,"account":{"login":"acme","type":"Organization"},"repository_selection":"selected"}]}"#)
+            case "/user/installations/1/repositories":
+                return settingsJSONResponse(statusCode: 200, body: #"{"repositories":[{"full_name":"acme/backend"}]}"#)
+            case "/user":
+                return settingsJSONResponse(statusCode: 200, body: #"{"id":7,"login":"mona"}"#)
+            case "/search/issues":
+                return settingsJSONResponse(statusCode: 200, body: #"{"total_count":0,"items":[]}"#)
+            case "/graphql" where failStatus.load() == 0:
+                graphRequests.store(graphRequests.load() + 1)
+                if partialBatchMode.load() == 1 && graphRequests.load() > 1 {
+                    return settingsJSONResponse(statusCode: 429, body: #"{"message":"API rate limit exceeded"}"#)
+                }
+                return settingsJSONResponse(statusCode: 200, body: #"{"data":{"repo0":{"pr0_0":{"reviewDecision":"APPROVED","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","statusCheckRollup":{"state":"SUCCESS","contexts":{"nodes":[]}},"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}"#.replacingOccurrences(of: "SUCCESS", with: failingChecks.load() == 1 ? "FAILURE" : "SUCCESS").replacingOccurrences(of: "MERGEABLE", with: unknownMergeability.load() == 1 ? "UNKNOWN" : "MERGEABLE"))
+            default:
+                return settingsJSONResponse(statusCode: 503, body: #"{"message":"temporary outage"}"#)
+            }
+        }
+        let provider = GitHubAuthProvider(configuration: settings.gitHubAppConfiguration, session: session, tokenStore: tokenStore)
+        let model = InboxViewModel(settings: settings, authProvider: provider, clientSession: session,
+                                   statusClock: { Date(timeIntervalSince1970: Double(clock.load())) },
+                                   notificationDelivery: { _, _, _ in notifications.store(notifications.load() + 1) })
+        guard await waitForMissingConfiguration(in: model, timeout: 2) else {
+            Issue.record("Initial refresh did not finish.")
+            return
+        }
+        _ = try settings.saveGitHubAppConfiguration(clientID: "Iv1.test", appSlug: "test-app", expectedOwner: "")
+        try tokenStore.saveCredential(testCredential())
+        settings.allowlistText = "org:acme"
+        await model.refresh()
+        #expect(model.authState.isAuthenticated)
+        let item = PullRequestItem(id: "acme/backend#7", repositoryName: "acme/backend", number: 7,
+                                   title: "Test", url: URL(string: "https://github.com/acme/backend/pull/7")!,
+                                   createdAt: .now, updatedAt: .now, isDraft: false)
+        // A view-first fetch must not prevent a notifying cache hit from establishing the baseline.
+        await model.refreshCIStatuses(for: [item], notifyFailures: false)
+        #expect(notifications.load() == 0)
+        await model.refreshCIStatuses(for: [item], notifyFailures: true)
+        #expect(model.statusSnapshot(for: item)?.hasIncompleteAttentionStatus == false)
+        let other = PullRequestItem(id: "acme/backend#8", repositoryName: "acme/backend", number: 8,
+                                    title: "Existing failure beyond the startup prefix", url: URL(string: "https://github.com/acme/backend/pull/8")!,
+                                    createdAt: item.createdAt, updatedAt: item.updatedAt, isDraft: false)
+        await model.refreshCIStatuses(for: [other], notifyFailures: false)
+        #expect(!model.hasActiveAlert)
+        #expect(model.statusSnapshot(for: other)?.needsAttention == (checkState == "FAILURE"))
+        await model.refreshCIStatuses(for: [other], notifyFailures: true)
+        #expect(!model.hasActiveAlert)
+        #expect(notifications.load() == 0)
+        unknownMergeability.store(1)
+        clock.store(1_061)
+        await model.refreshCIStatuses(for: [item])
+        #expect(model.statusSnapshot(for: item)?.hasIncompleteAttentionStatus == true)
+        let requestsBeforeRetry = graphRequests.load()
+        unknownMergeability.store(0)
+        await model.refreshCIStatuses(for: [item])
+        #expect(graphRequests.load() == requestsBeforeRetry + 1)
+        #expect(model.statusSnapshot(for: item)?.hasIncompleteAttentionStatus == false)
+        clock.store(1_122)
+        // Expiry alone must not remove a row during copying or keyboard navigation.
+        #expect(model.statusSnapshot(for: item)?.hasIncompleteAttentionStatus == false)
+        #expect(model.statusSnapshot(for: item)?.needsAttention == (checkState == "FAILURE"))
+        failStatus.store(1)
+        await model.refreshCIStatuses(for: [item])
+        #expect(model.statusSnapshot(for: item) == nil)
+        #expect(model.statusSnapshot(for: item)?.hasIncompleteAttentionStatus != false)
+        failStatus.store(0)
+        await model.refreshCIStatuses(for: [item], notifyFailures: false)
+        #expect(model.statusSnapshot(for: item)?.hasIncompleteAttentionStatus == false)
+        #expect(!model.hasActiveAlert)
+        #expect(notifications.load() == 0)
+        if checkState == "SUCCESS" {
+            failingChecks.store(1)
+            clock.store(1_183)
+            await model.refreshCIStatuses(for: [item], notifyFailures: true)
+            #expect(model.hasActiveAlert)
+            #expect(notifications.load() == 1)
+        }
+        // A later quota failure must retain the first completed batch in the model.
+        partialBatchMode.store(1)
+        graphRequests.store(0)
+        clock.store(1_244)
+        let batch = [item] + (9...28).map { number in
+            PullRequestItem(id: "acme/backend#\(number)", repositoryName: "acme/backend", number: number,
+                            title: "Batch", url: URL(string: "https://github.com/acme/backend/pull/\(number)")!,
+                            createdAt: item.createdAt, updatedAt: item.updatedAt, isDraft: false)
+        }
+        await model.refreshCIStatuses(for: batch)
+        #expect(graphRequests.load() == 2)
+        #expect(model.statusSnapshot(for: item)?.hasIncompleteAttentionStatus == false)
+        #expect(model.statusSnapshot(for: batch.last!) == nil)
+        #expect(model.ciDebugSummary(for: batch.last!)?.contains("rate limit") == true)
+
+    }
+
+    @Test
+    func viewStatusFetchWaitsForModelRefreshAndReusesItsCache() async throws {
+        let tokenStore = testTokenStore(account: "status-overlap")
+        defer { try? tokenStore.deleteCredential() }
+        let settings = makeSettings(account: "status-overlap", tokenStore: tokenStore,
+                                    configuration: GitHubAuthConfiguration(clientID: "", appSlug: "", expectedOwners: []))
+        let graphRequests = LockedSettingsTestInt(0)
+        let session = makeSettingsMockSession { request in
+            let url = try #require(request.url)
+            switch url.path {
+            case "/user/installations":
+                return settingsJSONResponse(statusCode: 200, body: #"{"installations":[{"id":1,"account":{"login":"acme","type":"Organization"},"repository_selection":"selected"}]}"#)
+            case "/user/installations/1/repositories":
+                return settingsJSONResponse(statusCode: 200, body: #"{"repositories":[{"full_name":"acme/backend"}]}"#)
+            case "/user":
+                return settingsJSONResponse(statusCode: 200, body: #"{"id":7,"login":"mona"}"#)
+            case "/search/issues":
+                let query = url.query?.removingPercentEncoding ?? ""
+                if query.contains("review-requested") {
+                    return settingsJSONResponse(statusCode: 200, body: #"{"total_count":1,"items":[{"number":7,"title":"Test","html_url":"https://github.com/acme/backend/pull/7","repository_url":"https://api.github.com/repos/acme/backend","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","draft":false}]}"#)
+                }
+                return settingsJSONResponse(statusCode: 200, body: #"{"total_count":0,"items":[]}"#)
+            case "/graphql":
+                graphRequests.store(graphRequests.load() + 1)
+                Thread.sleep(forTimeInterval: 0.1)
+                return settingsJSONResponse(statusCode: 200, body: #"{"data":{"repo0":{"pr0_0":{"reviewDecision":"APPROVED","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","statusCheckRollup":{"state":"SUCCESS","contexts":{"nodes":[]}},"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}"#)
+            default:
+                return settingsJSONResponse(statusCode: 503, body: #"{"message":"Unexpected endpoint"}"#)
+            }
+        }
+        let provider = GitHubAuthProvider(configuration: settings.gitHubAppConfiguration, session: session, tokenStore: tokenStore)
+        let model = InboxViewModel(settings: settings, authProvider: provider, clientSession: session,
+                                   notificationDelivery: { _, _, _ in })
+        guard await waitForMissingConfiguration(in: model, timeout: 2) else {
+            Issue.record("Initial refresh did not finish.")
+            return
+        }
+        _ = try settings.saveGitHubAppConfiguration(clientID: "Iv1.test", appSlug: "test-app", expectedOwner: "")
+        try tokenStore.saveCredential(testCredential())
+        settings.allowlistText = "org:acme"
+        let refresh = Task { await model.refresh() }
+        let deadline = Date().addingTimeInterval(2)
+        while model.reviewRequests.isEmpty && Date() < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(model.isLoading)
+        #expect(model.lastRefreshAt == nil)
+        await model.refreshCIStatuses(for: model.reviewRequests, notifyFailures: false)
+        await refresh.value
+        #expect(graphRequests.load() == 1)
+        #expect(model.lastRefreshAt != nil)
+        #expect(model.statusSnapshot(for: try #require(model.reviewRequests.first))?.status == .readyToMerge)
+    }
+
     @Test
     func ignoresUnexpandedBuildSettingPlaceholders() {
         let configuration = GitHubAuthConfiguration.load(

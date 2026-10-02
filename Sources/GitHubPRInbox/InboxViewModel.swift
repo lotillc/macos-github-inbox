@@ -24,6 +24,8 @@ final class InboxViewModel: ObservableObject {
     private let settings: AppSettings
     private let authProvider: GitHubAuthProvider
     private let clientSession: URLSession
+    private let statusClock: @Sendable () -> Date
+    private let notificationDelivery: (@MainActor @Sendable (String, String, String) async -> Void)?
     private var lastKnownSessionSummary: GitHubSessionSummary?
     private var hasOwnerClassification = false
     private var authoredSource: [PullRequestItem] = []
@@ -36,6 +38,7 @@ final class InboxViewModel: ObservableObject {
     private var activeWorkflowFailureAlertIDs = Set<String>()
     private var hasEstablishedWorkflowFailureBaseline = false
     private var notifiedCIFailureIDs = Set<String>()
+    private var invalidAttentionSnapshotIDs = Set<String>()
     private var activeCIFailureAlertIDs = Set<String>()
     private var hasEstablishedCIFailureBaseline = false
     private var assignedPullRequestNewItemTracker = NewItemTracker()
@@ -53,11 +56,15 @@ final class InboxViewModel: ObservableObject {
     init(
         settings: AppSettings,
         authProvider: GitHubAuthProvider = GitHubAuthProvider(),
-        clientSession: URLSession = .shared
+        clientSession: URLSession = .shared,
+        statusClock: @escaping @Sendable () -> Date = { .now },
+        notificationDelivery: (@MainActor @Sendable (String, String, String) async -> Void)? = nil
     ) {
         self.settings = settings
         self.authProvider = authProvider
         self.clientSession = clientSession
+        self.statusClock = statusClock
+        self.notificationDelivery = notificationDelivery
 
         bindSettings()
         configureRefreshTimer(minutes: settings.refreshIntervalMinutes)
@@ -189,7 +196,6 @@ final class InboxViewModel: ObservableObject {
             authoredSource = authoredResults
             workflowFailureSource = workflowResults
             applySnapshot()
-            lastRefreshAt = Date()
             await updateWorkflowFailureAlerts(connectionGeneration: generation)
             guard isCurrentConnection(generation) else {
                 return
@@ -199,6 +205,7 @@ final class InboxViewModel: ObservableObject {
                 return
             }
 
+            lastRefreshAt = Date()
             if workflowMonitoringIsCapped {
                 statusMessage = "Workflow monitoring is limited to the first \(Self.maximumWorkflowRepositoryRequests) accessible repositories. Select specific repositories in Settings to monitor a different set."
             } else if reviewRequests.isEmpty && authoredPullRequests.isEmpty && workflowFailures.isEmpty {
@@ -619,6 +626,14 @@ final class InboxViewModel: ObservableObject {
         ciStatusesByPullRequestID[item.id] ?? .unknown
     }
 
+    func statusSnapshot(for item: PullRequestItem) -> PullRequestStatusSnapshot? {
+        // Keep the last result visible until a refresh attempt succeeds or fails.
+        // Fetch freshness still controls when refreshCIStatuses requests new data.
+        guard let cached = ciStatusCache[item.id], cached.updatedAt == item.updatedAt,
+              !invalidAttentionSnapshotIDs.contains(item.id) else { return nil }
+        return cached.snapshot
+    }
+
     func unresolvedThreadCount(for item: PullRequestItem) -> Int? {
         guard let cached = ciStatusCache[item.id], cached.updatedAt == item.updatedAt else { return nil }
         return cached.snapshot.unresolvedThreadCount
@@ -640,15 +655,24 @@ final class InboxViewModel: ObservableObject {
         syncNewItemIDs()
     }
 
-    func refreshCIStatuses(for items: [PullRequestItem]) async {
-        await refreshCIStatuses(for: items, connectionGeneration: connectionGeneration)
+    func refreshCIStatuses(for items: [PullRequestItem], notifyFailures: Bool = false) async {
+        let generation = connectionGeneration
+        if isLoading {
+            for await loading in $isLoading.values {
+                guard !Task.isCancelled else { return }
+                if !loading { break }
+            }
+        }
+        guard isCurrentConnection(generation), !Task.isCancelled else { return }
+        await refreshCIStatuses(for: items, connectionGeneration: generation, notifyFailures: notifyFailures)
     }
 
     private func refreshCIStatuses(
         for items: [PullRequestItem],
-        connectionGeneration: UInt
+        connectionGeneration: UInt,
+        notifyFailures: Bool = true
     ) async {
-        guard authState.isAuthenticated else {
+        guard authState.isAuthenticated, !Task.isCancelled else {
             return
         }
 
@@ -658,8 +682,9 @@ final class InboxViewModel: ObservableObject {
             }
 
             return cached.updatedAt != item.updatedAt
-                || cached.snapshot.unresolvedThreadCount == nil
-                || Date().timeIntervalSince(cached.fetchedAt) >= 60
+                || invalidAttentionSnapshotIDs.contains(item.id)
+                || cached.snapshot.hasIncompleteAttentionStatus
+                || statusClock().timeIntervalSince(cached.fetchedAt) >= 60
         }
 
         guard !uncachedItems.isEmpty else {
@@ -669,6 +694,13 @@ final class InboxViewModel: ObservableObject {
                     ciDebugSummariesByPullRequestID[item.id] = cached.snapshot.debugSummary
                 }
             }
+            if !items.isEmpty, isCurrentConnection(connectionGeneration), !Task.isCancelled {
+                if notifyFailures {
+                    await updateCIFailureAlerts(for: items, connectionGeneration: connectionGeneration)
+                } else {
+                    baselineKnownFailures(for: items)
+                }
+            }
             return
         }
 
@@ -676,27 +708,38 @@ final class InboxViewModel: ObservableObject {
         do {
             let snapshotsByItemID = try await client.fetchCIStatusSnapshots(for: uncachedItems)
 
-            guard isCurrentConnection(connectionGeneration) else {
+            guard isCurrentConnection(connectionGeneration), !Task.isCancelled else {
                 return
             }
 
             for item in uncachedItems {
                 if let snapshot = snapshotsByItemID[item.id] {
-                    ciStatusCache[item.id] = (updatedAt: item.updatedAt, fetchedAt: .now, snapshot: snapshot)
+                    ciStatusCache[item.id] = (updatedAt: item.updatedAt, fetchedAt: statusClock(), snapshot: snapshot)
+                    invalidAttentionSnapshotIDs.remove(item.id)
                     ciStatusesByPullRequestID[item.id] = snapshot.status
                     ciDebugSummariesByPullRequestID[item.id] = snapshot.debugSummary
                 } else {
                     ciStatusesByPullRequestID[item.id] = .unknown
                     ciDebugSummariesByPullRequestID[item.id] = "error=No CI snapshot returned"
+                    invalidAttentionSnapshotIDs.insert(item.id)
                 }
             }
         } catch {
-            guard isCurrentConnection(connectionGeneration) else {
+            guard isCurrentConnection(connectionGeneration), !Task.isCancelled else {
                 return
             }
+            let completed = (error as? PartialStatusFetchError)?.snapshots ?? [:]
             for item in uncachedItems {
-                ciStatusesByPullRequestID[item.id] = .unknown
-                ciDebugSummariesByPullRequestID[item.id] = "error=\(error.localizedDescription)"
+                if let snapshot = completed[item.id] {
+                    ciStatusCache[item.id] = (updatedAt: item.updatedAt, fetchedAt: statusClock(), snapshot: snapshot)
+                    invalidAttentionSnapshotIDs.remove(item.id)
+                    ciStatusesByPullRequestID[item.id] = snapshot.status
+                    ciDebugSummariesByPullRequestID[item.id] = snapshot.debugSummary
+                } else {
+                    ciStatusesByPullRequestID[item.id] = .unknown
+                    ciDebugSummariesByPullRequestID[item.id] = "error=\(error.localizedDescription)"
+                    invalidAttentionSnapshotIDs.insert(item.id)
+                }
             }
         }
 
@@ -707,10 +750,20 @@ final class InboxViewModel: ObservableObject {
             }
         }
 
-        guard isCurrentConnection(connectionGeneration) else {
+        guard isCurrentConnection(connectionGeneration), !Task.isCancelled else {
             return
         }
-        await updateCIFailureAlerts(for: items, connectionGeneration: connectionGeneration)
+        if notifyFailures {
+            await updateCIFailureAlerts(for: items, connectionGeneration: connectionGeneration)
+        } else {
+            baselineKnownFailures(for: items)
+        }
+    }
+
+    private func baselineKnownFailures(for items: [PullRequestItem]) {
+        notifiedCIFailureIDs.formUnion(items.filter {
+            statusSnapshot(for: $0)?.status == .failure
+        }.map(\.id))
     }
 
     private func bindSettings() {
@@ -907,6 +960,10 @@ final class InboxViewModel: ObservableObject {
     }
 
     private func deliverNotification(identifier: String, title: String, body: String) async {
+        if let notificationDelivery {
+            await notificationDelivery(identifier, title, body)
+            return
+        }
         let notificationCenter = UNUserNotificationCenter.current()
         let granted = try? await notificationCenter.requestAuthorization(options: [.badge, .sound, .alert])
         guard granted == true else {
@@ -932,6 +989,7 @@ final class InboxViewModel: ObservableObject {
         reviewSource = []
         workflowFailureSource = []
         ciStatusCache = [:]
+        invalidAttentionSnapshotIDs = []
         ciStatusesByPullRequestID = [:]
         ciDebugSummariesByPullRequestID = [:]
         activeCIFailureAlertIDs = []

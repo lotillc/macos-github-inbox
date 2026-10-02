@@ -217,3 +217,26 @@ exclude general PR conversation comments. Counts refresh with the existing PR st
 Hover over a row for its full title and repository. Select a repository to hide the repeated
 repository label and give titles more room. The link button copies the URL without opening it,
 then briefly shows a checkmark. The list scrolls within the menu; “Show more” has no 30-row cap.
+
+Search the inbox by title, repository, or exact PR number (with or without `#` and commas).
+Search also matches workflow names and branches in Failures. Repository and search filters
+combine. Press `⌘F` to focus search; typing leaves list shortcuts inactive. Return finishes
+editing and restores list navigation; Escape clears the query and restores navigation.
+
+“Needs attention” narrows PRs to failed checks, merge conflicts, or unresolved review threads.
+It checks all matching PRs in the selected queue, including rows beyond the first ten. Checking
+progress and unavailable/incomplete status counts are shown separately; an unknown status is
+not treated as a known clean PR. Refresh retries unavailable data. Failures already contains
+failed workflows, so this toggle applies only to Assigned and Authored. Tab counts reflect
+known attention matches when the toggle is enabled.
+
+Status fetches triggered by searching, filtering, or expanding the menu do not generate CI
+failure notifications. Attention results retain the last fetched classification until a
+refresh attempt; a failed attempt marks that classification unavailable until a successful
+retry. Picker changes, copy-link actions, and list controls restore keyboard navigation while
+search editing retains text focus.
+
+View-driven status checks wait for a model refresh to finish and reuse its status cache.
+Large queues use sequential GraphQL batches of 20 PRs. If a batch fails, REST fallback checks
+at most that batch, with four PRs in flight; remaining rows are reported as incomplete until
+retry. Authentication and rate-limit errors skip REST fallback.
