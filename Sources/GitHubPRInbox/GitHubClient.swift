@@ -230,6 +230,9 @@ actor GitHubClient {
         let name: String?
         let htmlURL: URL
         let headBranch: String?
+        let runNumber: Int?
+        let displayTitle: String?
+        let headSHA: String?
         let status: String
         let conclusion: String?
         let createdAt: Date
@@ -239,6 +242,9 @@ actor GitHubClient {
             case id
             case name
             case htmlURL = "html_url"
+            case runNumber = "run_number"
+            case displayTitle = "display_title"
+            case headSHA = "head_sha"
             case headBranch = "head_branch"
             case status
             case conclusion
@@ -507,6 +513,9 @@ actor GitHubClient {
                         id: "\(repositoryName)#workflow-run-\(run.id)",
                         repositoryName: repositoryName,
                         workflowName: workflowName,
+                        runNumber: run.runNumber,
+                        displayTitle: run.displayTitle,
+                        headSHA: run.headSHA,
                         branchName: run.headBranch,
                         url: run.htmlURL,
                         createdAt: run.createdAt,

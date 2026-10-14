@@ -30,7 +30,6 @@ struct GitHubPRInboxApp: App {
             )
             .onAppear {
                 inboxViewModel.acknowledgeAlerts()
-                inboxViewModel.acknowledgeSeenChanges()
             }
         } label: {
             MenuBarStatusIcon(
