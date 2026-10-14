@@ -7,75 +7,108 @@ struct SettingsView: View {
     @ObservedObject var settings: AppSettings
     @ObservedObject var launchAtLoginManager: LaunchAtLoginManager
 
-    @State private var watchScopeDraft = Set<RepositoryScope>()
-    @State private var trackedWorkflowsDraft = ""
-    @State private var gitHubAppClientIDDraft = ""
-    @State private var gitHubAppSlugDraft = ""
-    @State private var gitHubAppExpectedOwnerDraft = ""
-    @State private var gitHubAppConfigurationError: String?
+    @State private var draft = SettingsDraft()
+    @State private var savedDraft = SettingsDraft()
+    @State private var hasLoadedDrafts = false
+    @State private var isGitHubAppExpanded = false
+    @State private var isSaving = false
+    @State private var saveError: String?
+    @State private var saveMessage: String?
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 header
-                gitHubAppSection
-                Divider()
+                if settings.gitHubAppConfiguration.missingConfigurationMessage != nil {
+                    gitHubAppSection
+                    Divider()
+                }
                 accountSection
+                    .disabled(hasChangedGitHubAppConfiguration)
+                if hasChangedGitHubAppConfiguration {
+                    Text("Save GitHub App changes before connecting to GitHub.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 Divider()
                 watchSection
                 Divider()
                 alertsSection
                 Divider()
                 appSection
+                if settings.gitHubAppConfiguration.missingConfigurationMessage == nil {
+                    Divider()
+                    gitHubAppSection
+                }
             }
             .padding(24)
+            .disabled(isSaving)
         }
         .background(Color(nsColor: .windowBackgroundColor))
+        .safeAreaInset(edge: .bottom, spacing: 0) { saveControls }
         .frame(minWidth: 620, minHeight: 700)
         .task {
-            watchScopeDraft = Set(settings.scopes)
-            trackedWorkflowsDraft = settings.trackedWorkflowNamesText
-            gitHubAppClientIDDraft = settings.gitHubAppClientID
-            gitHubAppSlugDraft = settings.gitHubAppSlug
-            gitHubAppExpectedOwnerDraft = settings.gitHubAppExpectedOwner
+            if !hasLoadedDrafts { reloadDrafts() }
         }
-        .onReceive(model.$removedArchivedRepositoryNames) { archivedRepositories in
-            guard !archivedRepositories.isEmpty else {
-                return
-            }
-
-            watchScopeDraft = Set(watchScopeDraft.filter { scope in
-                guard case let .repo(repository) = scope else {
-                    return true
-                }
-
-                return !archivedRepositories.contains(repository.lowercased())
-            })
+        .onChange(of: SettingsDraft(settings: settings)) { _, current in
+            guard hasLoadedDrafts, !isSaving else { return }
+            draft = SettingsDraft.rebased(draft, from: savedDraft, onto: current)
+            savedDraft = current
+        }
+        .onReceive(model.$removedArchivedRepositoryNames) { names in
+            reconcileArchivedScopes(names)
+        }
+        .onChange(of: model.availableRepositoryNames) { _, _ in
+            reconcileArchivedScopes(model.removedArchivedRepositoryNames)
         }
     }
 
-    private var gitHubAppSection: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            sectionLabel("GitHub App")
+    private func reconcileArchivedScopes(_ names: Set<String>) {
+        let currentlyArchived = Set(names.map { $0.lowercased() })
+            .subtracting(model.availableRepositoryNames.map { $0.lowercased() })
+        draft.watchScopes = Set(draft.watchScopes.filter { scope in
+            guard case let .repo(repository) = scope else { return true }
+            return !currentlyArchived.contains(repository.lowercased())
+        })
+    }
 
+    private var gitHubAppSection: some View {
+        DisclosureGroup(isExpanded: $isGitHubAppExpanded) {
+            gitHubAppFields.padding(.top, 10)
+        } label: {
+            VStack(alignment: .leading, spacing: 4) {
+                sectionLabel("GitHub App")
+                Text(settings.gitHubAppConfiguration.missingConfigurationMessage == nil
+                     ? "Configured: \(settings.gitHubAppSlug)" : "Required before signing in")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var gitHubAppFields: some View {
+        VStack(alignment: .leading, spacing: 12) {
             Text("Enter the public Client ID and slug for your organization’s GitHub App. Do not enter a PAT, client secret, or private key.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
             twoColumnRow(label: "Client ID") {
-                TextField("Iv1…", text: $gitHubAppClientIDDraft)
+                TextField("Iv1…", text: $draft.clientID)
+                    .accessibilityLabel("GitHub App Client ID")
                     .textFieldStyle(.roundedBorder)
                     .autocorrectionDisabled()
             }
 
             twoColumnRow(label: "App slug") {
-                TextField("your-github-app", text: $gitHubAppSlugDraft)
+                TextField("your-github-app", text: $draft.appSlug)
+                    .accessibilityLabel("GitHub App slug")
                     .textFieldStyle(.roundedBorder)
                     .autocorrectionDisabled()
             }
 
             twoColumnRow(label: "Expected orgs") {
-                TextField("Optional organization logins, comma-separated", text: $gitHubAppExpectedOwnerDraft)
+                TextField("Optional organization logins, comma-separated", text: $draft.expectedOwners)
+                    .accessibilityLabel("Expected organizations")
                     .textFieldStyle(.roundedBorder)
                     .autocorrectionDisabled()
             }
@@ -84,35 +117,10 @@ struct SettingsView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
-            HStack(spacing: 10) {
-                Button("Save GitHub App") {
-                    Task {
-                        do {
-                            try await model.saveGitHubAppConfiguration(
-                                clientID: gitHubAppClientIDDraft,
-                                appSlug: gitHubAppSlugDraft,
-                                expectedOwner: gitHubAppExpectedOwnerDraft
-                            )
-                            gitHubAppClientIDDraft = settings.gitHubAppClientID
-                            gitHubAppSlugDraft = settings.gitHubAppSlug
-                            gitHubAppExpectedOwnerDraft = settings.gitHubAppExpectedOwner
-                            gitHubAppConfigurationError = nil
-                        } catch {
-                            gitHubAppConfigurationError = error.localizedDescription
-                        }
-                    }
+            if model.appInstallURL != nil {
+                Button("Open App Install Page") {
+                    model.openAppInstallationPage()
                 }
-                .disabled(!hasChangedGitHubAppConfiguration)
-
-                if model.appInstallURL != nil {
-                    Button("Open App Install Page") {
-                        model.openAppInstallationPage()
-                    }
-                }
-            }
-
-            if let gitHubAppConfigurationError {
-                authMessage(gitHubAppConfigurationError, tone: .warning)
             }
         }
     }
@@ -338,7 +346,7 @@ struct SettingsView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
-            if pickerRepositoryNames.isEmpty && watchScopeDraft.isEmpty {
+            if pickerRepositoryNames.isEmpty && draft.watchScopes.isEmpty {
                 authMessage("Sign in, then refresh auth status to load repositories for this picker.", tone: .neutral)
             } else {
                 HStack(spacing: 10) {
@@ -358,7 +366,7 @@ struct SettingsView: View {
                     }
 
                     Button("Clear Repository Selections") {
-                        watchScopeDraft = Set(watchScopeDraft.filter { scope in
+                        draft.watchScopes = Set(draft.watchScopes.filter { scope in
                             if case .org = scope {
                                 return true
                             }
@@ -380,7 +388,7 @@ struct SettingsView: View {
             }
 
             HStack {
-                Text("\(watchScopeDraft.count) watch scope\(watchScopeDraft.count == 1 ? "" : "s")")
+                Text("\(draft.watchScopes.count) watch scope\(draft.watchScopes.count == 1 ? "" : "s")")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
@@ -392,18 +400,6 @@ struct SettingsView: View {
                     }
                 }
                 .disabled(!settings.hasStoredCredentials)
-
-                Button("Apply") {
-                    settings.allowlistText = watchScopeDraft
-                        .map(\.qualifier)
-                        .sorted()
-                        .joined(separator: "\n")
-                    Task {
-                        await model.refreshAuthStatus(forceValidation: true)
-                        await model.refresh()
-                    }
-                }
-                .disabled(watchScopeDraft == Set(settings.scopes))
             }
         }
     }
@@ -471,12 +467,12 @@ struct SettingsView: View {
 
     private var repositoryOwners: [String] {
         let ownersFromRepositories = pickerRepositoryNames.map { RepositoryScope.repo($0).ownerName }
-        let ownersFromScopes = watchScopeDraft.map(\.ownerName)
+        let ownersFromScopes = draft.watchScopes.map(\.ownerName)
         return canonicalNames(model.availableRepositoryOwners + ownersFromRepositories + ownersFromScopes)
     }
 
     private var pickerRepositoryNames: [String] {
-        let selectedRepositories = watchScopeDraft.compactMap { scope -> String? in
+        let selectedRepositories = draft.watchScopes.compactMap { scope -> String? in
             guard case let .repo(repository) = scope else {
                 return nil
             }
@@ -518,7 +514,7 @@ struct SettingsView: View {
     }
 
     private func hasRepositoryScope(_ repository: String) -> Bool {
-        watchScopeDraft.contains { scope in
+        draft.watchScopes.contains { scope in
             guard case let .repo(selectedRepository) = scope else {
                 return false
             }
@@ -527,19 +523,19 @@ struct SettingsView: View {
     }
 
     private func setRepositoryScope(_ repository: String, selected: Bool) {
-        watchScopeDraft = Set(watchScopeDraft.filter { scope in
+        draft.watchScopes = Set(draft.watchScopes.filter { scope in
             guard case let .repo(selectedRepository) = scope else {
                 return true
             }
             return selectedRepository.caseInsensitiveCompare(repository) != .orderedSame
         })
         if selected {
-            watchScopeDraft.insert(.repo(repository))
+            draft.watchScopes.insert(.repo(repository))
         }
     }
 
     private func hasOrganizationScope(_ organization: String) -> Bool {
-        watchScopeDraft.contains { scope in
+        draft.watchScopes.contains { scope in
             guard case let .org(selectedOrganization) = scope else {
                 return false
             }
@@ -548,7 +544,7 @@ struct SettingsView: View {
     }
 
     private func hasUserScope(_ user: String) -> Bool {
-        watchScopeDraft.contains { scope in
+        draft.watchScopes.contains { scope in
             guard case let .user(selectedUser) = scope else {
                 return false
             }
@@ -561,32 +557,32 @@ struct SettingsView: View {
     }
 
     private func setOrganizationScope(_ organization: String, selected: Bool) {
-        watchScopeDraft = Set(watchScopeDraft.filter { scope in
+        draft.watchScopes = Set(draft.watchScopes.filter { scope in
             guard case let .org(selectedOrganization) = scope else {
                 return true
             }
             return selectedOrganization.caseInsensitiveCompare(organization) != .orderedSame
         })
         if selected {
-            watchScopeDraft.insert(.org(organization))
+            draft.watchScopes.insert(.org(organization))
         }
     }
 
     private func setUserScope(_ user: String, selected: Bool) {
-        watchScopeDraft = Set(watchScopeDraft.filter { scope in
+        draft.watchScopes = Set(draft.watchScopes.filter { scope in
             guard case let .user(selectedUser) = scope else {
                 return true
             }
             return selectedUser.caseInsensitiveCompare(user) != .orderedSame
         })
         if selected {
-            watchScopeDraft.insert(.user(user))
+            draft.watchScopes.insert(.user(user))
         }
     }
 
     private func setOwnerScope(_ owner: String, selected: Bool) {
         guard selected else {
-            watchScopeDraft = Set(watchScopeDraft.filter { scope in
+            draft.watchScopes = Set(draft.watchScopes.filter { scope in
                 switch scope {
                 case let .org(selectedOwner), let .user(selectedOwner):
                     return selectedOwner.caseInsensitiveCompare(owner) != .orderedSame
@@ -605,7 +601,7 @@ struct SettingsView: View {
     }
 
     private var selectedRepositoryCount: Int {
-        watchScopeDraft.reduce(into: 0) { count, scope in
+        draft.watchScopes.reduce(into: 0) { count, scope in
             if case .repo = scope {
                 count += 1
             }
@@ -620,10 +616,12 @@ struct SettingsView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
-            editorCard(text: $trackedWorkflowsDraft, minHeight: 90)
+            editorCard(text: $draft.trackedWorkflows, minHeight: 90)
+                .accessibilityLabel("Tracked workflow names")
+                .help("Enter one workflow name per line")
 
             HStack {
-                let trackedWorkflowCount = trackedWorkflowsDraft
+                let trackedWorkflowCount = draft.trackedWorkflows
                     .split(whereSeparator: \.isNewline)
                     .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                     .filter { !$0.isEmpty }
@@ -634,14 +632,6 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
 
                 Spacer()
-
-                Button("Apply") {
-                    settings.trackedWorkflowNamesText = trackedWorkflowsDraft
-                    Task {
-                        await model.refresh()
-                    }
-                }
-                .disabled(trackedWorkflowsDraft == settings.trackedWorkflowNamesText)
             }
         }
     }
@@ -651,7 +641,7 @@ struct SettingsView: View {
             sectionLabel("App")
 
             twoColumnRow(label: "Refresh") {
-                Picker("Refresh", selection: $settings.refreshIntervalMinutes) {
+                Picker("Refresh", selection: $draft.refreshInterval) {
                     ForEach(AppSettings.supportedRefreshIntervals, id: \.self) { interval in
                         Text("\(interval) min").tag(interval)
                     }
@@ -659,13 +649,11 @@ struct SettingsView: View {
                 .labelsHidden()
                 .pickerStyle(.menu)
                 .frame(width: 120, alignment: .leading)
+                .accessibilityLabel("Refresh interval")
             }
 
             twoColumnRow(label: "Sort") {
-                Picker("Sort", selection: Binding(
-                    get: { settings.sortOption },
-                    set: { settings.sortOption = $0 }
-                )) {
+                Picker("Sort", selection: $draft.sortOption) {
                     ForEach(PullRequestSortOption.allCases) { option in
                         Text(option.title).tag(option)
                     }
@@ -673,43 +661,112 @@ struct SettingsView: View {
                 .labelsHidden()
                 .pickerStyle(.menu)
                 .frame(width: 220, alignment: .leading)
+                .accessibilityLabel("Default PR sort")
             }
 
-            Toggle(
-                "Launch at login",
-                isOn: Binding(
-                    get: { settings.launchAtLoginRequested },
-                    set: { newValue in
-                        settings.launchAtLoginRequested = newValue
-
-                        Task {
-                            let success = await launchAtLoginManager.setEnabled(newValue)
-                            if !success {
-                                settings.launchAtLoginRequested = !newValue
-                            }
-                        }
-                    }
-                )
-            )
-
-            if let launchAtLoginError = launchAtLoginManager.lastErrorMessage {
-                Text(launchAtLoginError)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
+            Toggle("Launch at login", isOn: $draft.launchAtLogin)
 
             Button("Refresh Now") {
-                Task {
-                    await model.refresh()
-                }
+                Task { await model.refresh() }
             }
+            .help("Refresh using saved settings. Save changes to apply edits.")
         }
     }
 
     private var hasChangedGitHubAppConfiguration: Bool {
-        gitHubAppClientIDDraft != settings.gitHubAppClientID
-            || gitHubAppSlugDraft != settings.gitHubAppSlug
-            || gitHubAppExpectedOwnerDraft != settings.gitHubAppExpectedOwner
+        draft.clientID != savedDraft.clientID || draft.appSlug != savedDraft.appSlug
+            || draft.expectedOwners != savedDraft.expectedOwners
+    }
+
+    private var hasChanges: Bool { hasLoadedDrafts && draft != savedDraft }
+
+    private var saveControls: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Divider()
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    if let saveError {
+                        Text(saveError).foregroundStyle(.red)
+                    } else {
+                        Text(hasChanges ? "Unsaved changes" : (saveMessage ?? "Changes take effect when you save."))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .font(.caption)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                Button("Revert changes", action: reloadDrafts)
+                    .disabled(!hasChanges || isSaving)
+                Button(isSaving ? "Saving…" : "Save changes") {
+                    Task { await saveChanges() }
+                }
+                .keyboardShortcut("s", modifiers: .command)
+                .disabled(!hasChanges || isSaving)
+            }
+            .padding(.horizontal, 24)
+            .padding(.bottom, 16)
+            .padding(.top, 8)
+        }
+        .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    private func reloadDrafts() {
+        savedDraft = SettingsDraft(settings: settings)
+        draft = savedDraft
+        hasLoadedDrafts = true
+        isGitHubAppExpanded = settings.gitHubAppConfiguration.missingConfigurationMessage != nil
+        saveError = nil
+        saveMessage = nil
+    }
+
+    private func saveChanges() async {
+        guard hasChanges, !isSaving else { return }
+        isSaving = true
+        defer {
+            let current = SettingsDraft(settings: settings)
+            draft = SettingsDraft.rebased(draft, from: savedDraft, onto: current)
+            savedDraft = current
+            isSaving = false
+        }
+        saveError = nil
+        saveMessage = nil
+        var proposed = draft
+        let baseline = savedDraft
+        do {
+            // Validate and save app identity before applying any other preferences.
+            if hasChangedGitHubAppConfiguration {
+                try await model.saveGitHubAppConfiguration(
+                    clientID: proposed.clientID, appSlug: proposed.appSlug, expectedOwner: proposed.expectedOwners
+                )
+            }
+            proposed = SettingsDraft.preparedForSaving(proposed, from: baseline,
+                onto: SettingsDraft(settings: settings), excluding: model.removedArchivedRepositoryNames,
+                availableRepositories: Set(model.availableRepositoryNames))
+            settings.allowlistText = proposed.watchScopes.map(\.qualifier).sorted().joined(separator: "\n")
+            settings.trackedWorkflowNamesText = proposed.trackedWorkflows
+            settings.refreshIntervalMinutes = proposed.refreshInterval
+            settings.sortOption = proposed.sortOption
+
+            var launchError: String?
+            if proposed.launchAtLogin != settings.launchAtLoginRequested {
+                if await launchAtLoginManager.setEnabled(proposed.launchAtLogin) {
+                    settings.launchAtLoginRequested = proposed.launchAtLogin
+                } else {
+                    launchError = launchAtLoginManager.lastErrorMessage ?? "Could not update launch at login."
+                }
+            }
+            reloadDrafts()
+            if let launchError {
+                draft.launchAtLogin = proposed.launchAtLogin
+                saveError = "Other settings saved. Launch at login: \(launchError)"
+            } else {
+                saveMessage = "Changes saved."
+            }
+            await model.refreshAuthStatus(forceValidation: true)
+            await model.refresh()
+        } catch {
+            saveError = error.localizedDescription
+            isGitHubAppExpanded = true
+        }
     }
 
     private enum AuthMessageTone {

@@ -979,6 +979,56 @@ struct AppSettingsTests {
         #expect(configuration.expectedOwners.isEmpty)
     }
 
+    @Test
+    func settingsDraftKeepsEditsLocalAndIncorporatesExternalSortChanges() {
+        let settings = makeSettings(account: "settings-draft")
+        let saved = SettingsDraft(settings: settings)
+        var draft = saved
+        draft.watchScopes = [.repo("acme/backend")]
+        draft.refreshInterval = 15
+        draft.trackedWorkflows = "Build\nDeploy"
+        #expect(settings.scopes.isEmpty)
+        #expect(settings.refreshIntervalMinutes == saved.refreshInterval)
+        #expect(settings.trackedWorkflowNamesText == saved.trackedWorkflows)
+
+        settings.sortOption = .oldestFirst // The inbox can change sorting while Settings is open.
+        let current = SettingsDraft(settings: settings)
+        let rebased = SettingsDraft.rebased(draft, from: saved, onto: current)
+        #expect(rebased.sortOption == .oldestFirst)
+        #expect(rebased.refreshInterval == 15)
+        #expect(rebased.watchScopes == [.repo("acme/backend")])
+        #expect(rebased.trackedWorkflows == "Build\nDeploy")
+        #expect(SettingsDraft.rebased(saved, from: saved, onto: current) == current)
+    }
+
+    @Test
+    func savingAfterValidationKeepsExternalSortAndArchivedCleanup() {
+        var baseline = SettingsDraft()
+        baseline.watchScopes = [.repo("acme/retired")]
+        var proposed = baseline
+        proposed.expectedOwners = "acme"
+        proposed.watchScopes.insert(.repo("acme/backend"))
+        var current = baseline
+        // These changes happen while asynchronous configuration validation is running.
+        current.sortOption = .oldestFirst
+        current.watchScopes = []
+        let prepared = SettingsDraft.preparedForSaving(proposed, from: baseline, onto: current,
+                                                       excluding: ["ACME/retired"])
+        #expect(prepared.sortOption == .oldestFirst)
+        #expect(prepared.watchScopes == [.repo("acme/backend")])
+        #expect(prepared.expectedOwners == "acme")
+    }
+
+    @Test
+    func permitsWatchingRepositoriesThatWereUnarchivedAfterCleanup() {
+        let baseline = SettingsDraft()
+        var proposed = baseline
+        proposed.watchScopes = [.repo("acme/restored")]
+        let prepared = SettingsDraft.preparedForSaving(proposed, from: baseline, onto: baseline,
+            excluding: ["acme/restored"], availableRepositories: ["ACME/restored"])
+        #expect(prepared.watchScopes == [.repo("acme/restored")])
+    }
+
     private func makeSettings(
         account: String,
         tokenStore: KeychainTokenStore? = nil,
