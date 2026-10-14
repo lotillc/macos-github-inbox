@@ -83,6 +83,7 @@ struct InboxMenuView: View {
     @State private var isCheckingAttention = false
     @FocusState private var isSearchFocused: Bool
     @State private var selectedRepository = ""
+    @State private var isRecovering = false
     @State private var isMenuVisible = false
     @State private var rowFrames: [String: CGRect] = [:]
     @State private var viewedRowIDs: [InboxSection: Set<String>] = [:]
@@ -96,8 +97,8 @@ struct InboxMenuView: View {
         VStack(alignment: .leading, spacing: 10) {
             header
 
-            if let statusMessage = model.statusMessage {
-                statusBanner(statusMessage)
+            if let notice = model.statusNotice, !model.hasConfigurationIssue {
+                statusBanner(notice)
             }
 
             if model.hasConfigurationIssue {
@@ -109,8 +110,9 @@ struct InboxMenuView: View {
                     searchControls
                 }
                 sectionPicker
-                if selectedSection != .workflowFailures {
-                    listControls
+                listControls
+                if hasActiveFilters {
+                    filterSummary
                 }
                 contentArea
             }
@@ -205,7 +207,10 @@ struct InboxMenuView: View {
                 }
 
                 if let lastRefreshAt = model.lastRefreshAt, !model.hasConfigurationIssue {
-                    Text("Updated \(PullRequestDateFormatter.ageString(for: lastRefreshAt))")
+                    TimelineView(.periodic(from: .now, by: 60)) { _ in
+                        Text("Updated \(PullRequestDateFormatter.ageString(for: lastRefreshAt))")
+                    }
+                    .help("Last successful update: \(lastRefreshAt.formatted())")
                 }
             }
             .font(.caption)
@@ -226,6 +231,8 @@ struct InboxMenuView: View {
                 }
                 .buttonStyle(.borderless)
                 .help("Refresh now")
+                .accessibilityLabel("Refresh inbox")
+                .disabled(model.isLoading || isRecovering)
 
                 Button {
                     openSettings()
@@ -234,13 +241,20 @@ struct InboxMenuView: View {
                 }
                 .buttonStyle(.borderless)
                 .help("Open settings")
+                .accessibilityLabel("Open settings")
 
-                Button("Quit") {
-                    NSApplication.shared.terminate(nil)
+                Menu {
+                    Button("Quit GitHub PR Inbox") {
+                        NSApplication.shared.terminate(nil)
+                    }
+                    .keyboardShortcut("q", modifiers: .command)
+                } label: {
+                    Image(systemName: "ellipsis.circle")
                 }
-                .buttonStyle(.borderless)
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .accessibilityLabel("More actions")
+                .help("More actions")
             }
         }
     }
@@ -279,6 +293,7 @@ struct InboxMenuView: View {
         .buttonStyle(.plain)
         .accessibilityLabel("\(section.title), \(sectionCount(for: section)) items")
         .accessibilityAddTraits(isSelected ? [.isSelected] : [])
+        .help("\(section.title): count reflects active filters")
     }
 
     private var repositoryNames: [String] {
@@ -321,18 +336,54 @@ struct InboxMenuView: View {
         HStack(spacing: 8) {
             Toggle("Needs attention", isOn: $needsAttentionOnly)
                 .toggleStyle(.button)
-                .help("Show failed checks, merge conflicts, or unresolved review threads")
+                .disabled(selectedSection == .workflowFailures)
+                .help(selectedSection == .workflowFailures
+                      ? "Applies to Assigned and Authored. All workflows here have failed."
+                      : "Show failed checks, merge conflicts, or unresolved review threads")
+                .accessibilityHint("Filters Assigned and Authored only")
             Spacer()
-            Picker("Sort", selection: $settings.sortOption) {
-                ForEach(PullRequestSortOption.allCases) { option in
-                    Text(option.title).tag(option)
+            if selectedSection == .workflowFailures {
+                Text("All failures · newest first")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            } else {
+                Picker("Sort", selection: $settings.sortOption) {
+                    ForEach(PullRequestSortOption.allCases) { option in
+                        Text(option.title).tag(option)
+                    }
                 }
+                .labelsHidden()
+                .accessibilityLabel("Sort pull requests")
+                .frame(width: 180)
             }
-            .labelsHidden()
-            .accessibilityLabel("Sort pull requests")
-            .frame(width: 180)
         }
         .controlSize(.small)
+    }
+
+    private var hasActiveFilters: Bool {
+        !selectedRepository.isEmpty || !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || needsAttentionOnly
+    }
+
+    private var filterSummary: some View {
+        HStack(spacing: 8) {
+            Text("Counts reflect active filters\(needsAttentionOnly ? "; attention applies to PRs" : "")")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Spacer()
+            Button("Clear filters", action: clearFilters)
+                .buttonStyle(.borderless)
+                .font(.caption)
+        }
+    }
+
+    private func clearFilters() {
+        searchText = ""
+        selectedRepository = ""
+        needsAttentionOnly = false
+        isSearchFocused = false
+        visibleRowLimitBySection = [:]
+        keyboardFocusRevision += 1
     }
 
     private var listFilter: InboxListFilter {
@@ -358,6 +409,7 @@ struct InboxMenuView: View {
                     isSearchFocused = false
                 }
                 .accessibilityLabel("Search inbox")
+                .help("Search titles, PR or run numbers, repositories, workflows, and branches")
             if !searchText.isEmpty {
                 Button {
                     searchText = ""
@@ -419,8 +471,14 @@ struct InboxMenuView: View {
                     .foregroundStyle(.secondary)
             }
 
-            Button("Open Settings") {
-                openSettings()
+            HStack(spacing: 10) {
+                let action: InboxRecoveryAction = model.authState.isAuthenticated
+                    ? .settings : .action(for: model.authState, informational: false)
+                Button(action.rawValue) { recover(using: action) }
+                    .disabled(isRecovering || model.isLoading)
+                if action != .settings && action != .continueSignIn {
+                    Button("Open Settings", action: openSettings)
+                }
             }
         }
         .font(.caption)
@@ -464,9 +522,13 @@ struct InboxMenuView: View {
                         if let highlightedRowID { proxy.scrollTo(highlightedRowID) }
                     }
                 }
-                Text("Showing \(visibleCount) of \(currentCount)")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                if currentCount > visibleCount || hasActiveFilters {
+                    Text(currentCount > visibleCount
+                         ? "Showing \(visibleCount) of \(currentCount)\(hasActiveFilters ? " matching results" : "")"
+                         : "\(currentCount) matching \(selectedSection == .workflowFailures ? (currentCount == 1 ? "failure" : "failures") : (currentCount == 1 ? "PR" : "PRs"))")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             if needsAttentionOnly && selectedSection != .workflowFailures {
@@ -475,9 +537,15 @@ struct InboxMenuView: View {
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 } else if incompleteAttentionCount > 0 {
-                    Text("Status unavailable or incomplete for \(incompleteAttentionCount) PRs. Refresh to retry.")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
+                    HStack {
+                        Text("Status unavailable or incomplete for \(incompleteAttentionCount) PRs.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        Button("Retry status") { recover(using: .retry) }
+                            .buttonStyle(.borderless)
+                            .font(.caption2)
+                            .disabled(model.isLoading || isRecovering)
+                    }
                 }
             }
 
@@ -823,19 +891,54 @@ struct InboxMenuView: View {
         }
     }
 
-    private func statusBanner(_ message: String) -> some View {
-        HStack(alignment: .top, spacing: 8) {
-            Image(systemName: "exclamationmark.triangle")
-                .foregroundStyle(.yellow)
-
-            Text(message)
+    private func statusBanner(_ notice: InboxStatusNotice) -> some View {
+        let action = notice.recoveryAction
+            ?? InboxRecoveryAction.action(for: model.authState, informational: notice.tone == .information)
+        return HStack(alignment: .top, spacing: 8) {
+            Image(systemName: notice.tone == .information ? "info.circle" : "exclamationmark.triangle")
+                .foregroundStyle(notice.tone == .information ? Color.accentColor : .yellow)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(notice.message)
+                if notice.tone == .warning, model.lastRefreshAt != nil, !model.hasConfigurationIssue {
+                    Text("Showing results from the last successful update.")
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            Spacer(minLength: 4)
+            Button(action.rawValue) { recover(using: action) }
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .disabled(isRecovering || model.isLoading)
         }
         .padding(10)
         .background(.quaternary.opacity(0.55))
         .clipShape(RoundedRectangle(cornerRadius: 10))
     }
+
+    private func recover(using action: InboxRecoveryAction) {
+        switch action {
+        case .settings, .continueSignIn:
+            openSettings()
+        case .sso:
+            model.openSSOAuthorization()
+            openSettings()
+        case .install:
+            model.openAppInstallationPage()
+            openSettings()
+        case .reconnect:
+            openSettings()
+            Task { await model.beginSignIn() }
+        case .retry:
+            guard !isRecovering, !model.isLoading else { return }
+            isRecovering = true
+            Task {
+                defer { isRecovering = false }
+                await model.refreshAuthStatus(forceValidation: true)
+                await model.refresh()
+            }
+        }
+    }
+
 }
 
 private struct PullRequestRow: View {

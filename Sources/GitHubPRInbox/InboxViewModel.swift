@@ -12,7 +12,8 @@ final class InboxViewModel: ObservableObject {
     @Published private(set) var authState: GitHubAuthenticationState = .signedOut
     @Published private(set) var isLoading = false
     @Published private(set) var lastRefreshAt: Date?
-    @Published private(set) var statusMessage: String?
+    @Published private(set) var statusNotice: InboxStatusNotice?
+    var statusMessage: String? { statusNotice?.message }
     @Published private(set) var authStatusMessage: String?
     @Published private(set) var removedArchivedRepositoryNames = Set<String>()
     @Published private(set) var ciStatusesByPullRequestID: [String: PullRequestCIStatus] = [:]
@@ -151,20 +152,20 @@ final class InboxViewModel: ObservableObject {
         }
 
         if case .rateLimited = authState {
-            statusMessage = authState.guidanceText
+            statusNotice = InboxStatusNotice(message: authState.guidanceText)
             return
         }
 
         guard authState.isAuthenticated else {
             clearLoadedData(resetStatus: false)
-            statusMessage = authState.guidanceText
+            statusNotice = InboxStatusNotice(message: authState.guidanceText)
             return
         }
 
         let scopes = settings.scopes
         guard !scopes.isEmpty else {
             clearLoadedData(resetStatus: false)
-            statusMessage = "Add at least one org or repo in Settings."
+            statusNotice = InboxStatusNotice(message: "Add at least one org or repo in Settings.")
             return
         }
 
@@ -207,11 +208,9 @@ final class InboxViewModel: ObservableObject {
 
             lastRefreshAt = Date()
             if workflowMonitoringIsCapped {
-                statusMessage = "Workflow monitoring is limited to the first \(Self.maximumWorkflowRepositoryRequests) accessible repositories. Select specific repositories in Settings to monitor a different set."
-            } else if reviewRequests.isEmpty && authoredPullRequests.isEmpty && workflowFailures.isEmpty {
-                statusMessage = "No open PRs matched your current filters."
+                statusNotice = InboxStatusNotice(message: "Workflow monitoring is limited to the first \(Self.maximumWorkflowRepositoryRequests) accessible repositories. Select specific repositories in Settings to monitor a different set.", tone: .information)
             } else {
-                statusMessage = nil
+                statusNotice = nil
             }
         } catch {
             guard isCurrentConnection(generation) else {
@@ -219,12 +218,12 @@ final class InboxViewModel: ObservableObject {
             }
             if shouldPreserveCachedInbox(for: error) {
                 preserveCachedInbox(for: error)
-                statusMessage = error.localizedDescription
+                statusNotice = InboxStatusNotice.failure(error)
                 return
             }
             clearLoadedData(resetStatus: true)
             mapRefreshError(error)
-            statusMessage = error.localizedDescription
+            statusNotice = InboxStatusNotice.failure(error)
         }
     }
 
@@ -396,7 +395,7 @@ final class InboxViewModel: ObservableObject {
                 hasOwnerClassification = false
                 authState = .signedOut
                 authStatusMessage = "Signed out of GitHub."
-                statusMessage = "Sign in with GitHub in Settings to load pull requests."
+                statusNotice = InboxStatusNotice(message: "Sign in with GitHub in Settings to load pull requests.")
                 clearLoadedData(resetStatus: true)
             } catch {
                 authStatusMessage = error.localizedDescription
@@ -604,7 +603,7 @@ final class InboxViewModel: ObservableObject {
             hasOwnerClassification = false
             authState = .signedOut
             authStatusMessage = "GitHub App changed. Reconnect to GitHub."
-            statusMessage = "Sign in with GitHub in Settings to load pull requests."
+            statusNotice = InboxStatusNotice(message: "Sign in with GitHub in Settings to load pull requests.")
             clearLoadedData(resetStatus: true)
             return
         }
@@ -985,6 +984,7 @@ final class InboxViewModel: ObservableObject {
     }
 
     private func clearLoadedData(resetStatus: Bool) {
+        lastRefreshAt = nil
         authoredSource = []
         reviewSource = []
         workflowFailureSource = []
