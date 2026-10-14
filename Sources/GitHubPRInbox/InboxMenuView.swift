@@ -81,6 +81,7 @@ struct InboxMenuView: View {
     @State private var searchText = ""
     @State private var needsAttentionOnly = false
     @State private var isCheckingAttention = false
+    @State private var isRetryingAttention = false
     @FocusState private var isSearchFocused: Bool
     @State private var selectedRepository = ""
     @State private var isRecovering = false
@@ -532,7 +533,7 @@ struct InboxMenuView: View {
             }
 
             if needsAttentionOnly && selectedSection != .workflowFailures {
-                if isCheckingAttention {
+                if isCheckingAttention || isRetryingAttention {
                     Text("Checking status across \(attentionCandidates.count) matching PRs…")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
@@ -541,10 +542,10 @@ struct InboxMenuView: View {
                         Text("Status unavailable or incomplete for \(incompleteAttentionCount) PRs.")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
-                        Button("Retry status") { recover(using: .retry) }
+                        Button("Retry status", action: retryAttentionStatuses)
                             .buttonStyle(.borderless)
                             .font(.caption2)
-                            .disabled(model.isLoading || isRecovering)
+                            .disabled(model.isLoading || isRecovering || isRetryingAttention)
                     }
                 }
             }
@@ -642,7 +643,7 @@ struct InboxMenuView: View {
 
     private func emptyResultText(defaultText: String) -> String {
         if needsAttentionOnly && selectedSection != .workflowFailures {
-            if isCheckingAttention { return "Checking for PRs that need attention…" }
+            if isCheckingAttention || isRetryingAttention { return "Checking for PRs that need attention…" }
             return incompleteAttentionCount > 0 ? "No known PRs needing attention." : "No PRs need attention."
         }
         return searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -913,6 +914,17 @@ struct InboxMenuView: View {
         .padding(10)
         .background(.quaternary.opacity(0.55))
         .clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+
+    private func retryAttentionStatuses() {
+        guard !isRetryingAttention, !isCheckingAttention, selectedSection != .workflowFailures else { return }
+        let candidates = attentionCandidates
+        isRetryingAttention = true
+        Task {
+            defer { isRetryingAttention = false }
+            await model.refreshCIStatuses(for: candidates, notifyFailures: false)
+            ensureHighlightedRowIsValid()
+        }
     }
 
     private func recover(using action: InboxRecoveryAction) {

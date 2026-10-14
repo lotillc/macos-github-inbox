@@ -232,7 +232,8 @@ editing and restores list navigation; Escape clears the query and restores navig
 “Needs attention” narrows PRs to failed checks, merge conflicts, or unresolved review threads.
 It checks all matching PRs in the selected queue, including rows beyond the first ten. Checking
 progress and unavailable/incomplete status counts are shown separately; an unknown status is
-not treated as a known clean PR. Refresh retries unavailable data. Failures already contains
+not treated as a known clean PR. Retry status checks only the matching PR statuses, without
+reloading the inbox or generating failure notifications. Failures already contains
 failed workflows, so this toggle applies only to Assigned and Authored. Tab counts reflect
 known attention matches when the toggle is enabled.
 
