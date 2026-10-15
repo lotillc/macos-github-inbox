@@ -34,7 +34,7 @@ struct GitHubPRInboxApp: App {
         } label: {
             MenuBarStatusIcon(
                 count: inboxViewModel.actionableInboxCount,
-                showsWarning: inboxViewModel.hasActiveAlert || (inboxViewModel.statusMessage != nil && !inboxViewModel.hasConfigurationIssue)
+                showsWarning: inboxViewModel.hasActiveAlert || (inboxViewModel.statusNotice?.tone == .warning && !inboxViewModel.hasConfigurationIssue)
             )
         }
         .menuBarExtraStyle(.window)

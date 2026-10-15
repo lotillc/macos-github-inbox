@@ -709,7 +709,7 @@ struct AppSettingsTests {
     }
 
     @Test
-    func ownerWatchScopesContinueCheckingTrackedWorkflowRepositories() async throws {
+    func ownerWatchScopesDistinguishEmptyAndFailedRefreshes() async throws {
         let tokenStore = testTokenStore(account: "owner-workflow-repositories")
         defer { try? tokenStore.deleteCredential() }
         let settings = makeSettings(
@@ -717,6 +717,7 @@ struct AppSettingsTests {
             tokenStore: tokenStore,
             configuration: GitHubAuthConfiguration(clientID: "", appSlug: "", expectedOwners: [])
         )
+        let responseMode = LockedSettingsTestInt(0)
         let session = makeSettingsMockSession { request in
             let url = try #require(request.url)
             switch (url.host, url.path) {
@@ -733,6 +734,12 @@ struct AppSettingsTests {
             case ("api.github.com", "/user"):
                 return settingsJSONResponse(statusCode: 200, body: #"{ "id": 7, "login": "mona" }"#)
             case ("api.github.com", "/search/issues"):
+                if responseMode.load() == 1 {
+                    return settingsJSONResponse(statusCode: 500, body: #"{"message":"Unavailable"}"#)
+                }
+                if responseMode.load() == 2 {
+                    return settingsJSONResponse(statusCode: 200, body: #"{"total_count":1001,"items":[]}"#)
+                }
                 return settingsJSONResponse(statusCode: 200, body: #"{ "total_count": 0, "items": [] }"#)
             case ("api.github.com", "/repos/acme/backend/actions/runs"):
                 return settingsJSONResponse(
@@ -766,6 +773,30 @@ struct AppSettingsTests {
         await model.refresh()
 
         #expect(model.workflowFailures.map(\.repositoryName) == ["acme/backend"])
+        #expect(model.statusNotice == nil)
+
+        // An empty, successfully refreshed inbox is a normal result, not a warning.
+        settings.trackedWorkflowNamesText = ""
+        await model.refresh()
+        #expect(model.workflowFailures.isEmpty)
+        #expect(model.reviewRequests.isEmpty)
+        #expect(model.authoredPullRequests.isEmpty)
+        #expect(model.lastRefreshAt != nil)
+        #expect(model.statusNotice == nil)
+
+        responseMode.store(1)
+        await model.refresh()
+        #expect(model.workflowFailures.isEmpty)
+        #expect(model.lastRefreshAt == nil)
+        #expect(model.statusNotice?.tone == .warning)
+
+        responseMode.store(0)
+        await model.refresh()
+        #expect(model.lastRefreshAt != nil)
+        responseMode.store(2)
+        await model.refresh()
+        #expect(model.statusNotice?.recoveryAction == .settings)
+        #expect(model.lastRefreshAt != nil) // The last successful empty snapshot is retained.
     }
 
     @Test(arguments: ["SUCCESS", "FAILURE"])

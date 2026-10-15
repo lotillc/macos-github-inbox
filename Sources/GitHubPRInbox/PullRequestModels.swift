@@ -307,3 +307,41 @@ enum InboxRowVisibility {
         })
     }
 }
+
+struct InboxStatusNotice: Equatable {
+    enum Tone { case warning, information }
+    let message: String
+    var tone: Tone = .warning
+    var recoveryAction: InboxRecoveryAction? = nil
+
+    static func failure(_ error: Error) -> Self {
+        let requiresSettings: Bool
+        if let clientError = error as? GitHubClientError, case .configuration = clientError {
+            requiresSettings = true
+        } else {
+            requiresSettings = false
+        }
+        return Self(message: error.localizedDescription, recoveryAction: requiresSettings ? .settings : nil)
+    }
+}
+
+enum InboxRecoveryAction: String {
+    case retry = "Retry"
+    case settings = "Open Settings"
+    case reconnect = "Reconnect"
+    case sso = "Open SSO"
+    case install = "Install GitHub App"
+    case continueSignIn = "Continue Sign-in"
+
+    static func action(for state: GitHubAuthenticationState, informational: Bool) -> Self {
+        if informational { return .settings }
+        switch state {
+        case .missingConfiguration: return .settings
+        case .signedOut, .refreshFailed: return .reconnect
+        case .authorizing: return .continueSignIn
+        case .ssoRequired: return .sso
+        case .installationMissing: return .install
+        case .signedIn, .rateLimited: return .retry
+        }
+    }
+}

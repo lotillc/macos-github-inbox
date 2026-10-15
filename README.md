@@ -210,7 +210,10 @@ with the adjacent × button. Queue counts reflect the selected repository. The s
 supports last updated, oldest created, and PR number in either direction; PR numbers are scoped
 to each repository, so number sorting is most useful with a repository selected.
 
-“Needs attention” and sorting sit below the tabs in PR queues.
+“Needs attention” and sorting sit below the tabs in PR queues. The attention control stays visible
+but is disabled in Failures, where all entries have failed. Active filters explain tab counts and
+provide “Clear filters,” including when there are no matching results. Result totals appear only
+for filtered or partially displayed lists.
 
 PR rows show plain numbers, compact update ages (`4m`, `12h`, `2d`), and unresolved review-thread
 counts beside a speech bubble. A dash means the count is unavailable; zero means all fetched
@@ -229,9 +232,15 @@ editing and restores list navigation; Escape clears the query and restores navig
 “Needs attention” narrows PRs to failed checks, merge conflicts, or unresolved review threads.
 It checks all matching PRs in the selected queue, including rows beyond the first ten. Checking
 progress and unavailable/incomplete status counts are shown separately; an unknown status is
-not treated as a known clean PR. Refresh retries unavailable data. Failures already contains
+not treated as a known clean PR. Retry status checks only the matching PR statuses, without
+reloading the inbox or generating failure notifications. Failures already contains
 failed workflows, so this toggle applies only to Assigned and Authored. Tab counts reflect
 known attention matches when the toggle is enabled.
+
+The header labels the last successful update and places Quit in the More actions menu (⌘Q).
+Warnings offer Retry, Reconnect, SSO, or Settings as appropriate; cached results are explicitly
+labeled during outages. Monitoring limits use an informational notice, and a successfully empty
+inbox does not show a warning.
 
 Status fetches triggered by searching, filtering, or expanding the menu do not generate CI
 failure notifications. Attention results retain the last fetched classification until a
