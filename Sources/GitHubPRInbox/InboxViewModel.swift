@@ -439,7 +439,7 @@ final class InboxViewModel: ObservableObject {
                     return
                 }
                 currentUser = summary.user
-                setAuthenticatedSession(summary, ownerClassificationKnown: true)
+                setAuthenticatedSession(summary, ownerClassificationKnown: true, inventoryIsFresh: true)
                 settings.reloadCredentialPresence()
                 return
             }
@@ -492,7 +492,7 @@ final class InboxViewModel: ObservableObject {
                 return
             }
             currentUser = summary.user
-            setAuthenticatedSession(summary, ownerClassificationKnown: true)
+            setAuthenticatedSession(summary, ownerClassificationKnown: true, inventoryIsFresh: true)
         } catch {
             guard isCurrentConnection(generation) else {
                 return
@@ -1150,8 +1150,12 @@ final class InboxViewModel: ObservableObject {
 
     private func setAuthenticatedSession(
         _ summary: GitHubSessionSummary,
-        ownerClassificationKnown: Bool? = nil
+        ownerClassificationKnown: Bool? = nil,
+        inventoryIsFresh: Bool = false
     ) {
+        if inventoryIsFresh {
+            removedArchivedRepositoryNames.subtract(summary.accessibleRepositories.map { $0.lowercased() })
+        }
         lastKnownSessionSummary = summary
         if let ownerClassificationKnown {
             hasOwnerClassification = ownerClassificationKnown
@@ -1160,6 +1164,8 @@ final class InboxViewModel: ObservableObject {
     }
 
     private func invalidateConnection() {
+        // Cleanup from another app/session must not filter the next connection's scopes.
+        removedArchivedRepositoryNames = []
         connectionGeneration &+= 1
         isLoading = false
     }
@@ -1192,7 +1198,7 @@ final class InboxViewModel: ObservableObject {
                 signInTask = nil
                 settings.reloadCredentialPresence()
                 currentUser = summary.user
-                setAuthenticatedSession(summary, ownerClassificationKnown: true)
+                setAuthenticatedSession(summary, ownerClassificationKnown: true, inventoryIsFresh: true)
                 authStatusMessage = "Signed in as @\(summary.user.login)."
                 await refresh()
                 return

@@ -671,9 +671,15 @@ struct AppSettingsTests {
                     body: #"{ "installations": [{ "id": 1, "account": { "login": "acme" }, "repository_selection": "selected" }] }"#
                 )
             case ("api.github.com", "/user/installations/1/repositories"):
-                let repositories = cleanupPhase.load() == 1
-                    ? #"[{ "full_name": "acme/backend" }, { "full_name": "acme/retired", "archived": true }]"#
-                    : #"[{ "full_name": "acme/backend" }, { "full_name": "acme/retired" }, { "full_name": "acme/obsolete", "archived": true }]"#
+                let repositories: String
+                switch cleanupPhase.load() {
+                case 1:
+                    repositories = #"[{"full_name":"acme/backend"},{"full_name":"acme/retired","archived":true}]"#
+                case 2:
+                    repositories = #"[{"full_name":"acme/backend"},{"full_name":"acme/retired"},{"full_name":"acme/obsolete","archived":true}]"#
+                default:
+                    repositories = #"[{"full_name":"acme/backend"},{"full_name":"acme/retired"},{"full_name":"acme/obsolete"}]"#
+                }
                 return settingsJSONResponse(statusCode: 200, body: "{ \"repositories\": \(repositories) }")
             default:
                 throw NSError(domain: "SettingsMockURLProtocol", code: 12)
@@ -706,6 +712,27 @@ struct AppSettingsTests {
 
         #expect(settings.scopes == [.repo("acme/backend"), .repo("acme/retired")])
         #expect(model.removedArchivedRepositoryNames == ["acme/obsolete"])
+
+        cleanupPhase.store(3)
+        await model.refreshAuthStatus(forceValidation: true)
+        #expect(model.availableRepositoryNames.contains("acme/obsolete"))
+        #expect(model.removedArchivedRepositoryNames.isEmpty)
+
+        cleanupPhase.store(2)
+        settings.allowlistText = "acme/backend\nacme/obsolete"
+        await model.refreshAuthStatus(forceValidation: true)
+        #expect(model.removedArchivedRepositoryNames == ["acme/obsolete"])
+        let baseline = SettingsDraft(settings: settings)
+        var proposed = baseline
+        proposed.watchScopes.insert(.repo("acme/obsolete"))
+        try await model.saveGitHubAppConfiguration(clientID: "Iv1.other", appSlug: "other-app", expectedOwner: "")
+        #expect(model.authState == .signedOut)
+        #expect(model.availableRepositoryNames.isEmpty)
+        #expect(model.removedArchivedRepositoryNames.isEmpty)
+        let prepared = SettingsDraft.preparedForSaving(proposed, from: baseline,
+            onto: SettingsDraft(settings: settings), excluding: model.removedArchivedRepositoryNames,
+            availableRepositories: Set(model.availableRepositoryNames))
+        #expect(prepared.watchScopes.contains(.repo("acme/obsolete")))
     }
 
     @Test
