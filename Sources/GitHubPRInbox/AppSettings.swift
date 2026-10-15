@@ -174,3 +174,56 @@ final class AppSettings: ObservableObject {
         return fallback
     }
 }
+
+/// Editable preferences stay local until Save changes is selected.
+struct SettingsDraft: Equatable {
+    var watchScopes: Set<RepositoryScope> = []
+    var trackedWorkflows: String = ""
+    var clientID: String = ""
+    var appSlug: String = ""
+    var expectedOwners: String = ""
+    var refreshInterval: Int = 5
+    var sortOption: PullRequestSortOption = .recentlyUpdatedFirst
+    var launchAtLogin: Bool = false
+
+    init() {}
+
+    @MainActor
+    init(settings: AppSettings) {
+        watchScopes = Set(settings.scopes)
+        trackedWorkflows = settings.trackedWorkflowNamesText
+        clientID = settings.gitHubAppClientID
+        appSlug = settings.gitHubAppSlug
+        expectedOwners = settings.gitHubAppExpectedOwner
+        refreshInterval = settings.refreshIntervalMinutes
+        sortOption = settings.sortOption
+        launchAtLogin = settings.launchAtLoginRequested
+    }
+
+    /// Incorporate externally saved preferences without discarding local edits.
+    static func rebased(_ draft: Self, from previous: Self, onto current: Self) -> Self {
+        var result = draft
+        if draft.watchScopes == previous.watchScopes { result.watchScopes = current.watchScopes }
+        if draft.trackedWorkflows == previous.trackedWorkflows { result.trackedWorkflows = current.trackedWorkflows }
+        if draft.clientID == previous.clientID { result.clientID = current.clientID }
+        if draft.appSlug == previous.appSlug { result.appSlug = current.appSlug }
+        if draft.expectedOwners == previous.expectedOwners { result.expectedOwners = current.expectedOwners }
+        if draft.refreshInterval == previous.refreshInterval { result.refreshInterval = current.refreshInterval }
+        if draft.sortOption == previous.sortOption { result.sortOption = current.sortOption }
+        if draft.launchAtLogin == previous.launchAtLogin { result.launchAtLogin = current.launchAtLogin }
+        return result
+    }
+
+    static func preparedForSaving(_ draft: Self, from previous: Self, onto current: Self,
+                                  excluding archivedRepositories: Set<String>, availableRepositories: Set<String> = []) -> Self {
+        var result = rebased(draft, from: previous, onto: current)
+        let archived = Set(archivedRepositories.map { $0.lowercased() })
+            .subtracting(availableRepositories.map { $0.lowercased() })
+        result.watchScopes = Set(result.watchScopes.filter { scope in
+            guard case let .repo(repository) = scope else { return true }
+            return !archived.contains(repository.lowercased())
+        })
+        return result
+    }
+
+}

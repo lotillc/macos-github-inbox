@@ -108,6 +108,12 @@ macOS Keychain.
 revocation, users revoke the GitHub App authorization in GitHub; administrators remove the app
 installation or repository access from the organization.
 
+Settings uses one **Save changes** button (⌘S) for GitHub App configuration, watched scopes,
+workflow names, refresh interval, default sorting, and launch at login. Edits stay local until saved;
+**Revert changes** restores saved values. Account actions such as sign-in and sign-out run immediately.
+After setup, GitHub App configuration is collapsed below everyday preferences. It expands at the top
+when configuration is required. Save app configuration before connecting with the new values.
+
 See GitHub's [GitHub App registration guide](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/registering-a-github-app) and [device-flow guide](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-user-access-token-for-a-github-app) for the current GitHub UI and policy details.
 
 ## Install
