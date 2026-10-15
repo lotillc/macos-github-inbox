@@ -205,10 +205,12 @@ That will also publish an unsigned release artifact. If you want signed/notarize
 
 ### Large inboxes
 
-Use the repository picker in the menu to narrow all three queues to one repository. Clear it
+Repository selection and search share a row above the queue tabs and narrow all three queues. Clear the repository filter
 with the adjacent × button. Queue counts reflect the selected repository. The sort picker
 supports last updated, oldest created, and PR number in either direction; PR numbers are scoped
 to each repository, so number sorting is most useful with a repository selected.
+
+“Needs attention” and sorting sit below the tabs in PR queues.
 
 PR rows show plain numbers, compact update ages (`4m`, `12h`, `2d`), and unresolved review-thread
 counts beside a speech bubble. A dash means the count is unavailable; zero means all fetched
@@ -219,8 +221,9 @@ repository label and give titles more room. The link button copies the URL witho
 then briefly shows a checkmark. The list scrolls within the menu; “Show more” has no 30-row cap.
 
 Search the inbox by title, repository, or exact PR number (with or without `#` and commas).
-Search also matches workflow names and branches in Failures. Repository and search filters
-combine. Press `⌘F` to focus search; typing leaves list shortcuts inactive. Return finishes
+Search also matches workflow names, run numbers, commit summaries, and branches in Failures. Repository and search filters
+combine. Failure rows show run numbers and commit summaries (or a short commit SHA when available),
+and hide repeated repository labels when a repository is selected. Press `⌘F` to focus search; typing leaves list shortcuts inactive. Return finishes
 editing and restores list navigation; Escape clears the query and restores navigation.
 
 “Needs attention” narrows PRs to failed checks, merge conflicts, or unresolved review threads.
@@ -235,6 +238,9 @@ failure notifications. Attention results retain the last fetched classification 
 refresh attempt; a failed attempt marks that classification unavailable until a successful
 retry. Picker changes, copy-link actions, and list controls restore keyboard navigation while
 search editing retains text focus.
+
+New-item markers remain across refreshes until seen. Closing the menu acknowledges the rows
+that entered the viewport in each visited queue; unopened queues and offscreen rows retain their markers.
 
 View-driven status checks wait for a model refresh to finish and reuse its status cache.
 Large queues use sequential GraphQL batches of 20 PRs. If a batch fails, REST fallback checks

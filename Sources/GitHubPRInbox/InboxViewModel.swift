@@ -648,10 +648,10 @@ final class InboxViewModel: ObservableObject {
         activeCIFailureAlertIDs = []
     }
 
-    func acknowledgeSeenChanges() {
-        assignedPullRequestNewItemTracker.clearNewIDs()
-        authoredPullRequestNewItemTracker.clearNewIDs()
-        workflowFailureNewItemTracker.clearNewIDs()
+    func acknowledgeSeenChanges(assignedIDs: Set<String>, authoredIDs: Set<String>, workflowIDs: Set<String>) {
+        assignedPullRequestNewItemTracker.acknowledge(ids: assignedIDs)
+        authoredPullRequestNewItemTracker.acknowledge(ids: authoredIDs)
+        workflowFailureNewItemTracker.acknowledge(ids: workflowIDs)
         syncNewItemIDs()
     }
 

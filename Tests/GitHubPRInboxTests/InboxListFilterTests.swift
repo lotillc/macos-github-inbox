@@ -24,11 +24,21 @@ struct InboxListFilterTests {
     @Test
     func searchesWorkflowNamesAndBranches() {
         let item = WorkflowFailureItem(id: "run", repositoryName: "acme/app", workflowName: "Deploy Production",
+                                       runNumber: 42, displayTitle: "Fix deployment timeout", headSHA: "abcdef123456",
                                        branchName: "release/october", url: URL(string: "https://example.com")!,
                                        createdAt: .now, updatedAt: .now)
         #expect(InboxListFilter(searchText: "PRODUCTION").matches(item))
         #expect(InboxListFilter(searchText: "october", needsAttentionOnly: true).matches(item))
         #expect(!InboxListFilter(repository: "other/app").matches(item))
+        #expect(InboxListFilter(searchText: "#42").matches(item))
+        #expect(InboxListFilter(searchText: "timeout").matches(item))
+        #expect(item.runTitle == "Deploy Production #42 · Fix deployment timeout")
+        var legacyItem = item
+        legacyItem.displayTitle = "Deploy Production"
+        #expect(legacyItem.runTitle == "Deploy Production #42 · abcdef1")
+        legacyItem.headSHA = nil
+        legacyItem.runNumber = nil
+        #expect(legacyItem.runTitle == "Deploy Production")
     }
 
     @Test

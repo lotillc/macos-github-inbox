@@ -153,10 +153,27 @@ struct WorkflowFailureItem: Identifiable, Hashable {
     let id: String
     let repositoryName: String
     let workflowName: String
+    var runNumber: Int? = nil
+    var displayTitle: String? = nil
+    var headSHA: String? = nil
     let branchName: String?
     let url: URL
     let createdAt: Date
     let updatedAt: Date
+}
+
+extension WorkflowFailureItem {
+    var runTitle: String {
+        let number = runNumber.map { " #\($0)" } ?? ""
+        let summary = displayTitle?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let identity = summary.flatMap { $0.isEmpty || $0 == workflowName ? nil : $0 }
+            ?? headSHA.map { String($0.prefix(7)) }
+        return "\(workflowName)\(number)" + (identity.map { " · \($0)" } ?? "")
+    }
+
+    var detailDescription: String {
+        "\(runTitle)\n\(repositoryName) · \(branchName ?? "Unknown branch")\nUpdated \(updatedAt.formatted())"
+    }
 }
 
 struct InboxSnapshot {
@@ -171,15 +188,15 @@ struct NewItemTracker: Equatable {
 
     mutating func detectArrivals(currentIDs: Set<String>, previousIDs: Set<String>) {
         if hasEstablishedBaseline {
-            newIDs = currentIDs.subtracting(previousIDs)
+            newIDs = newIDs.union(currentIDs.subtracting(previousIDs)).intersection(currentIDs)
         } else {
             newIDs = []
             hasEstablishedBaseline = true
         }
     }
 
-    mutating func clearNewIDs() {
-        newIDs = []
+    mutating func acknowledge(ids: Set<String>) {
+        newIDs.subtract(ids)
     }
 
     mutating func reset() {
@@ -260,7 +277,7 @@ struct InboxListFilter: Equatable {
     func matches(_ item: WorkflowFailureItem) -> Bool {
         guard repository.isEmpty || item.repositoryName == repository else { return false }
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        return query.isEmpty || item.workflowName.localizedStandardContains(query)
+        return query.isEmpty || item.runTitle.localizedStandardContains(query)
             || item.repositoryName.localizedStandardContains(query)
             || item.branchName?.localizedStandardContains(query) == true
     }
@@ -277,5 +294,16 @@ extension PullRequestStatusSnapshot {
 
     var hasIncompleteAttentionStatus: Bool {
         status == .unknown || unresolvedThreadCount == nil || !hasKnownMergeability
+    }
+}
+
+/// A loaded row is only seen once some of it has entered the scroll viewport.
+enum InboxRowVisibility {
+    static func visibleIDs(frames: [String: CGRect], viewport: CGRect) -> Set<String> {
+        guard viewport.width > 0, viewport.height > 0 else { return [] }
+        return Set(frames.compactMap { id, frame in
+            let overlap = frame.intersection(viewport)
+            return !overlap.isNull && overlap.width > 0 && overlap.height > 0 ? id : nil
+        })
     }
 }

@@ -3,16 +3,6 @@ import SwiftUI
 
 @MainActor
 private enum PullRequestDateFormatter {
-    private static let relativeFormatter: RelativeDateTimeFormatter = {
-        let formatter = RelativeDateTimeFormatter()
-        formatter.unitsStyle = .short
-        return formatter
-    }()
-
-    static func relativeString(for date: Date) -> String {
-        relativeFormatter.localizedString(for: date, relativeTo: .now)
-    }
-
     static func ageString(for date: Date) -> String {
         let seconds = max(0, Date().timeIntervalSince(date))
         let units: [(seconds: Double, suffix: String)] = [
@@ -23,6 +13,14 @@ private enum PullRequestDateFormatter {
             return "\(Int(seconds / unit.seconds))\(unit.suffix)"
         }
         return "now"
+    }
+}
+
+private struct InboxRowFramesKey: PreferenceKey {
+    static let defaultValue: [String: CGRect] = [:]
+
+    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
     }
 }
 
@@ -85,6 +83,9 @@ struct InboxMenuView: View {
     @State private var isCheckingAttention = false
     @FocusState private var isSearchFocused: Bool
     @State private var selectedRepository = ""
+    @State private var isMenuVisible = false
+    @State private var rowFrames: [String: CGRect] = [:]
+    @State private var viewedRowIDs: [InboxSection: Set<String>] = [:]
     @State private var copiedRowID: String?
     @State private var keyboardFocusRevision = 0
     @State private var selectedSection: InboxSection = .reviewRequests
@@ -102,9 +103,15 @@ struct InboxMenuView: View {
             if model.hasConfigurationIssue {
                 onboardingSection
             } else {
+                HStack(spacing: 10) {
+                    repositoryControls
+                        .frame(width: 260)
+                    searchControls
+                }
                 sectionPicker
-                listControls
-                searchControls
+                if selectedSection != .workflowFailures {
+                    listControls
+                }
                 contentArea
             }
         }
@@ -139,7 +146,18 @@ struct InboxMenuView: View {
             ensureHighlightedRowIsValid()
         }
         .onAppear {
+            isMenuVisible = true
+            viewedRowIDs = [:]
+            recordViewedRows()
             ensureHighlightedRowIsValid()
+        }
+        .onDisappear {
+            isMenuVisible = false
+            model.acknowledgeSeenChanges(
+                assignedIDs: viewedRowIDs[.reviewRequests, default: []],
+                authoredIDs: viewedRowIDs[.authoredPullRequests, default: []],
+                workflowIDs: viewedRowIDs[.workflowFailures, default: []]
+            )
         }
         .onChange(of: searchText) { _, _ in
             visibleRowLimitBySection = [:]
@@ -151,6 +169,7 @@ struct InboxMenuView: View {
             ensureHighlightedRowIsValid()
         }
         .onChange(of: currentSelectableRows().map(\.id)) { _, _ in
+            recordViewedRows()
             ensureHighlightedRowIsValid()
         }
         .onChange(of: selectedRepository) { _, _ in
@@ -163,6 +182,7 @@ struct InboxMenuView: View {
             ensureHighlightedRowIsValid()
         }
         .onChange(of: selectedSection) { _, _ in
+            recordViewedRows()
             keyboardFocusRevision += 1
             ensureHighlightedRowIsValid()
         }
@@ -185,7 +205,7 @@ struct InboxMenuView: View {
                 }
 
                 if let lastRefreshAt = model.lastRefreshAt, !model.hasConfigurationIssue {
-                    Text(PullRequestDateFormatter.relativeString(for: lastRefreshAt))
+                    Text("Updated \(PullRequestDateFormatter.ageString(for: lastRefreshAt))")
                 }
             }
             .font(.caption)
@@ -239,21 +259,26 @@ struct InboxMenuView: View {
     private func sectionButton(for section: InboxSection) -> some View {
         let isSelected = selectedSection == section
 
-        return HStack(spacing: 5) {
-            Text(section.title)
-            Text(sectionCount(for: section))
-                .foregroundStyle(isSelected ? .white.opacity(0.9) : .secondary)
-        }
-        .font(.caption.weight(.semibold))
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
-        .frame(maxWidth: .infinity)
-        .background(isSelected ? Color.accentColor : Color.clear)
-        .clipShape(RoundedRectangle(cornerRadius: 7))
-        .contentShape(RoundedRectangle(cornerRadius: 7))
-        .onTapGesture {
+        return Button {
             selectedSection = section
+        } label: {
+            HStack(spacing: 5) {
+                Text(section.title)
+                Text(sectionCount(for: section))
+                    .foregroundStyle(isSelected ? .white.opacity(0.9) : .secondary)
+            }
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(isSelected ? .white : .primary)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .frame(maxWidth: .infinity)
+            .background(isSelected ? Color.accentColor : Color.clear)
+            .clipShape(RoundedRectangle(cornerRadius: 7))
+            .contentShape(RoundedRectangle(cornerRadius: 7))
         }
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(section.title), \(sectionCount(for: section)) items")
+        .accessibilityAddTraits(isSelected ? [.isSelected] : [])
     }
 
     private var repositoryNames: [String] {
@@ -263,7 +288,7 @@ struct InboxMenuView: View {
             .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
     }
 
-    private var listControls: some View {
+    private var repositoryControls: some View {
         HStack(spacing: 8) {
             Picker("Repository", selection: $selectedRepository) {
                 Text("All repositories").tag("")
@@ -276,24 +301,36 @@ struct InboxMenuView: View {
             }
             .labelsHidden()
             .accessibilityLabel("Filter by repository")
+            .lineLimit(1)
+            .truncationMode(.middle)
             .frame(maxWidth: .infinity)
+            .help(selectedRepository.isEmpty ? "Filter all queues by repository" : selectedRepository)
             if !selectedRepository.isEmpty {
                 Button { selectedRepository = "" } label: {
                     Image(systemName: "xmark.circle.fill")
                 }
                 .buttonStyle(.borderless)
                 .help("Clear repository filter")
+                .accessibilityLabel("Clear repository filter")
             }
-            if selectedSection != .workflowFailures {
-                Picker("Sort", selection: $settings.sortOption) {
-                    ForEach(PullRequestSortOption.allCases) { option in
-                        Text(option.title).tag(option)
-                    }
+        }
+        .controlSize(.small)
+    }
+
+    private var listControls: some View {
+        HStack(spacing: 8) {
+            Toggle("Needs attention", isOn: $needsAttentionOnly)
+                .toggleStyle(.button)
+                .help("Show failed checks, merge conflicts, or unresolved review threads")
+            Spacer()
+            Picker("Sort", selection: $settings.sortOption) {
+                ForEach(PullRequestSortOption.allCases) { option in
+                    Text(option.title).tag(option)
                 }
-                .labelsHidden()
-                .accessibilityLabel("Sort pull requests")
-                .frame(width: 180)
             }
+            .labelsHidden()
+            .accessibilityLabel("Sort pull requests")
+            .frame(width: 180)
         }
         .controlSize(.small)
     }
@@ -312,7 +349,7 @@ struct InboxMenuView: View {
             .keyboardShortcut("f", modifiers: .command)
             .help("Search inbox (⌘F)")
             .accessibilityLabel("Focus search")
-            TextField("Search title, PR number, or repository", text: $searchText)
+            TextField("Search inbox…", text: $searchText)
                 .textFieldStyle(.plain)
                 .focused($isSearchFocused)
                 .onSubmit { isSearchFocused = false }
@@ -330,11 +367,6 @@ struct InboxMenuView: View {
                     .buttonStyle(.borderless)
                     .help("Clear search")
                     .accessibilityLabel("Clear search")
-            }
-            if selectedSection != .workflowFailures {
-                Toggle("Needs attention", isOn: $needsAttentionOnly)
-                    .toggleStyle(.button)
-                    .help("Show failed checks, merge conflicts, or unresolved review threads")
             }
         }
         .font(.caption)
@@ -420,6 +452,11 @@ struct InboxMenuView: View {
                         ))
                     }
                     .frame(height: CGFloat(min(visibleCount, 10)) * (Self.rowHeight + 4))
+                    .coordinateSpace(name: "inboxViewport")
+                    .onPreferenceChange(InboxRowFramesKey.self) { frames in
+                        rowFrames = frames
+                        recordViewedRows()
+                    }
                     .onChange(of: highlightedRowID) { _, id in
                         if let id { proxy.scrollTo(id) }
                     }
@@ -485,6 +522,7 @@ struct InboxMenuView: View {
                         case let .workflowFailure(item):
                             WorkflowFailureRow(
                                 item: item,
+                                showRepository: selectedRepository.isEmpty,
                                 isHighlighted: highlightedRowID == row.id,
                                 isNew: model.newlyWorkflowFailureIDs.contains(item.id)
                             )
@@ -498,7 +536,7 @@ struct InboxMenuView: View {
                             copiedRowID = row.id
                         }
                     } label: {
-                        Image(systemName: copiedRowID == row.id ? "checkmark" : "link")
+                        Image(systemName: copiedRowID == row.id ? "checkmark" : "doc.on.doc")
                             .font(.system(size: 11))
                             .frame(width: 24, height: Self.rowHeight)
                     }
@@ -512,8 +550,26 @@ struct InboxMenuView: View {
                     }
                 }
                 .id(row.id)
+                .background(GeometryReader { geometry in
+                    Color.clear.preference(key: InboxRowFramesKey.self,
+                                           value: [row.id: geometry.frame(in: .named("inboxViewport"))])
+                })
             }
         }
+    }
+
+    private func recordViewedRows() {
+        guard isMenuVisible, !model.hasConfigurationIssue else { return }
+        let rows = currentSelectableRows()
+        let viewport = CGRect(x: 0, y: 0, width: Self.menuWidth - 24,
+                              height: CGFloat(min(rows.count, 10)) * (Self.rowHeight + 4))
+        let visibleIDs = InboxRowVisibility.visibleIDs(frames: rowFrames, viewport: viewport)
+        viewedRowIDs[selectedSection, default: []].formUnion(rows.filter { visibleIDs.contains($0.id) }.map { row in
+            switch row {
+            case let .pullRequest(item): item.id
+            case let .workflowFailure(item): item.id
+            }
+        })
     }
 
     private func emptyResultText(defaultText: String) -> String {
@@ -861,23 +917,26 @@ private struct PullRequestRow: View {
 
 private struct WorkflowFailureRow: View {
     let item: WorkflowFailureItem
+    let showRepository: Bool
     let isHighlighted: Bool
     let isNew: Bool
 
     var body: some View {
         HStack(spacing: 8) {
-            Circle()
-                .fill(Color.red)
-                .frame(width: 8, height: 8)
-                .padding(.horizontal, 3)
+            Image(systemName: "xmark.circle.fill")
+                .foregroundStyle(.red)
+                .font(.system(size: 11))
+                .frame(width: 14)
 
-            Text(item.workflowName)
+            Text(item.runTitle)
                 .font(.caption.weight(.medium))
                 .lineLimit(1)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .layoutPriority(1)
 
-            RepoPill(text: item.repositoryName, width: InboxMenuView.workflowRepoColumnWidth)
+            if showRepository {
+                RepoPill(text: item.repositoryName, width: InboxMenuView.workflowRepoColumnWidth)
+            }
 
             if let branchName = item.branchName, !branchName.isEmpty {
                 Text(branchName)
@@ -904,6 +963,9 @@ private struct WorkflowFailureRow: View {
         .background(backgroundStyle)
         .clipShape(RoundedRectangle(cornerRadius: 6))
         .contentShape(Rectangle())
+        .help(item.detailDescription)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(isNew ? "New. " : "")Failed: \(item.detailDescription)")
     }
 
     private var backgroundStyle: some ShapeStyle {
